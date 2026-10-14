@@ -53,16 +53,27 @@ by tests that pin behaviour the code is not obviously right about:
   missing query rather than a mistyped one, and a truthy non-string `name` fails
   generically because the reference raised inside path resolution;
 - a repeated frontmatter key keeps its last value instead of invalidating the
-  page, which a strict YAML parser would do;
+  page, which a strict YAML parser would do. Handling that in Rust took three
+  attempts: matching on the parser's error text missed nested repeats because
+  the message is prefixed with the key path, and dropping only the repeated key
+  line orphaned an indented value and produced invalid YAML in turn. It needs to
+  drop the whole entry, scoped by the enclosing mapping;
 - the frontmatter delimiter is read as a regex, not as "a line containing
-  exactly `---`", which decides whether `---\n---\nbody` has frontmatter at all;
+  exactly `---`", and `\s*` backtracks rather than taking the whole whitespace
+  run. Greedy-only gets `---\n---\nbody` right and `---\n\n---\nbody` wrong, and
+  the second one indexes the fence lines as body text, which perturbs the
+  length-normalization divisor for every query against that page;
 - CRLF is normalized on read, because it shifts every body offset and every
-  snippet line number.
+  snippet line number;
+- lines split the way Python's `splitlines` does, not the way Rust's `lines`
+  does, because snippet line numbers are counted off the split.
 
-One divergence is accepted and documented in the README: PyYAML implements YAML
-1.1 and reads a bare `yes`/`no`/`on`/`off` as a boolean. This binary uses a 1.2
-parser and reads them as strings. Emulating 1.1 would mean reimplementing
-scalar resolution to emulate a quirk most writers consider a bug.
+Two divergences are accepted and documented in the README. PyYAML implements
+YAML 1.1 and reads a bare `yes`/`no`/`on`/`off` as a boolean and a leading `0`
+as octal; this binary uses a 1.2 parser and reads them as strings. Emulating 1.1
+would mean reimplementing scalar resolution to reproduce a quirk most writers
+consider a bug — and the difference is visible in output only for values that
+should have been quoted anyway.
 
 See [wiki search ranking](2026-10-14-wiki-search-ranking.md) for why the ranking
 behaves the way it does, and

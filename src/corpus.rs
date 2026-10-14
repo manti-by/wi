@@ -60,13 +60,24 @@ impl CorpusCache {
 
     /// Returns the current snapshot for a directory, rebuilding it if stale.
     ///
-    /// Both the fingerprint and the rebuild run on the blocking pool: reading
-    /// and YAML-parsing every page on a runtime worker would stall the server
-    /// for the duration, including the SSE keepalives of live sessions. The
-    /// lock is held across the rebuild so concurrent cold searches cannot both
-    /// parse the directory.
+    /// Both the fingerprint and the rebuild run on the blocking pool: even the
+    /// cache-hit path stats every page, and reading and YAML-parsing them all
+    /// would otherwise stall the runtime — including the SSE keepalives of live
+    /// sessions. The lock is held across the rebuild so concurrent cold
+    /// searches cannot both parse the directory.
+    ///
+    /// The fingerprint is taken before the lock is acquired. A page written in
+    /// that window makes the next call mismatch once and rebuild, which is
+    /// wasted work at worst; the reverse order could publish a corpus whose
+    /// contents predate the fingerprint it is stored with, and those would
+    /// never be re-read.
     pub async fn get(&self, root: PathBuf) -> Arc<Corpus> {
-        let fingerprint = fingerprint_pages(&root);
+        let fingerprint = spawn_blocking({
+            let root = root.clone();
+            move || fingerprint_pages(&root)
+        })
+        .await
+        .unwrap_or_default();
 
         let mut cached = self.cached.lock().await;
         if let Some(corpus) = cached.as_ref()
@@ -76,27 +87,33 @@ impl CorpusCache {
             return Arc::clone(corpus);
         }
 
-        let built = tokio::task::spawn_blocking({
+        let built = spawn_blocking({
             let root = root.clone();
             let fingerprint = fingerprint.clone();
             move || build_corpus(&root, fingerprint)
         })
         .await;
 
-        // A panicking parse must not take every later tool call with it: the
-        // wiki is a directory of text files, and serving a stale snapshot is a
-        // far better failure than refusing to answer at all.
         match built {
             Ok(corpus) => Arc::clone(cached.insert(corpus)),
+            // A panicking parse must not take every later tool call with it, and
+            // the fallback is cached so a recurring panic cannot turn into a
+            // rebuild on every call.
             Err(error) => {
-                tracing::error!(%error, "corpus rebuild panicked");
-                match cached.as_ref() {
-                    Some(previous) => Arc::clone(previous),
-                    None => build_corpus(&root, Vec::new()),
-                }
+                tracing::error!(%error, "corpus rebuild panicked; serving an empty wiki");
+                Arc::clone(cached.insert(build_corpus(&root, Vec::new())))
             }
         }
     }
+}
+
+/// Runs a blocking closure on the blocking pool, tolerating a panicking one.
+async fn spawn_blocking<F, T>(work: F) -> Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await
 }
 
 /// Builds a fresh corpus from a directory, skipping unusable pages.

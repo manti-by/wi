@@ -108,9 +108,27 @@ implementation held a `std::sync::Mutex` across blocking file I/O on a runtime
 worker, which stalled the executor — including the SSE keepalives of live
 sessions — for the duration of a cold parse.
 
+The fingerprint itself is taken on the blocking pool too, even though it is only
+a `read_dir` plus a `stat` per file, because it is on the *cache-hit* path: it
+runs on every single tool call, which is exactly when it must not hold up the
+runtime.
+
 The cache is shared across MCP sessions rather than built per handler. The
 transport constructs one handler per connection, so a per-handler cache meant N
 clients caused N full parses and N copies of the corpus in memory.
+
+## Why the fingerprint is taken before the lock
+
+Taking the fingerprint first looks like a race, and it is — but only in the
+harmless direction. A page written between the fingerprint and the rebuild
+produces a corpus whose contents are *newer* than its recorded fingerprint, so
+the next call mismatches once and rebuilds: wasted work at worst.
+
+The reverse order is not harmless. Locking first and fingerprinting second
+could publish a corpus whose contents predate the fingerprint stored beside
+them, and those contents would never be re-read, because the comparison would
+keep matching. A silently stale corpus scores queries with statistics that do
+not describe it.
 
 ## Known limits
 

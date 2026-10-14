@@ -5,6 +5,7 @@
 //! search snippets — is derived here, so the three tools cannot disagree about
 //! how a page reads.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_yaml::Value;
@@ -77,19 +78,23 @@ fn scalar_to_string(value: &serde_json::Value) -> String {
         serde_json::Value::String(text) => text.clone(),
         serde_json::Value::Array(items) => format!(
             "[{}]",
-            items
-                .iter()
-                .map(scalar_to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
+            items.iter().map(python_repr).collect::<Vec<_>>().join(", ")
         ),
         serde_json::Value::Object(map) => format!(
             "{{{}}}",
             map.iter()
-                .map(|(key, value)| format!("{key:?}: {}", scalar_to_string(value)))
+                .map(|(key, value)| format!("'{}': {}", key, scalar_to_string(value)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+    }
+}
+
+/// Renders a string the way Python's `repr()` would, single-quoted.
+fn python_repr(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => format!("'{text}'"),
+        other => scalar_to_string(other),
     }
 }
 
@@ -181,116 +186,181 @@ fn normalize_newlines(text: &str) -> String {
 fn split_frontmatter(text: &str) -> Option<(&str, usize)> {
     let after_open = text.strip_prefix("---")?;
 
-    // `\s*` after the opening delimiter spans newlines too. Backtracking leaves
-    // the block starting right after the *last* newline of that run, and there
-    // has to be at least one newline for the delimiter to exist at all.
-    let trimmed = after_open.trim_start_matches([' ', '\t', '\r', '\n']);
-    let consumed = &after_open[..after_open.len() - trimmed.len()];
-    consumed.rfind('\n')?;
-
-    let rest = trimmed;
-    let rest_offset = text.len() - rest.len();
-
-    let mut cursor = 0;
-    // The block's first line can never be the closing delimiter: `\n---` needs
-    // a newline that belongs to the already-consumed opening delimiter, so
-    // `---\n---\nbody` is a page with no frontmatter at all.
-    let mut is_first_line = true;
-    let closing = loop {
-        let (line, advance) = match rest[cursor..].find('\n') {
-            Some(offset) => (&rest[cursor..cursor + offset], offset + 1),
-            None => (&rest[cursor..], rest.len() - cursor),
+    // `\s*` after the opening delimiter is greedy and backtracks one character
+    // at a time when no closing `\n---` follows. Which length wins is therefore
+    // load-bearing, and taking only the greedy one is wrong in both directions:
+    //
+    //   ---\n\n---\nbody  the greedy split finds no later `\n---`, so `\s*`
+    //                       shrinks until the blank line's own newline can serve
+    //                       as the delimiter's, giving empty frontmatter.
+    //   ---\n---\nbody   the same backtrack would match an empty block, but there
+    //                       is no second newline to give up, so the opening
+    //                       delimiter cannot also close the block.
+    //
+    // Longest-first is the regex engine's own order.
+    let run = after_open.len() - after_open.trim_start_matches(is_python_whitespace).len();
+    for width in (0..=run).rev() {
+        let Some(consumed) = after_open.get(..width) else {
+            continue;
         };
-        if !is_first_line && line.starts_with("---") {
-            break cursor;
+        if !consumed.chars().all(is_python_whitespace) || !after_open[width..].starts_with('\n') {
+            continue;
         }
-        is_first_line = false;
-        if advance == 0 {
-            return None;
-        }
-        cursor += advance;
-        if cursor >= rest.len() {
-            return None;
-        }
-    };
 
-    // The closing `---`, then `\s*`, which eats the rest of the fence line and
-    // any blank lines after it.
-    let after = &rest[closing + 3..];
-    let body = after.trim_start_matches([' ', '\t', '\r', '\n']);
-    Some((
-        &rest[..closing],
-        rest_offset + closing + 3 + (after.len() - body.len()),
-    ))
+        let rest = &after_open[width + 1..];
+        let rest_offset = text.len() - rest.len();
+
+        // `(.*?)` is lazy, so the earliest `\n---` at or after this split wins.
+        let Some(closing) = rest.find("\n---") else {
+            continue;
+        };
+
+        // `\s*\n?` after the closing fence is greedy with nothing to constrain
+        // it, so it eats every blank line up to the first real content.
+        let after = &rest[closing + 4..];
+        let body = after.trim_start_matches(is_python_whitespace);
+        let body_offset = rest_offset + closing + 4 + (after.len() - body.len());
+        return Some((&rest[..closing], body_offset));
+    }
+
+    None
 }
 
-/// Parses a frontmatter block, rejecting duplicate keys the way YAML strictly
-/// does — but keeping the last value instead of discarding the page.
+/// Whether a character is whitespace for a Python `\s` in a str pattern.
 ///
-/// The reference loader resolves duplicates last-wins, so a page that happens to
-/// repeat a key stays visible. A stricter parser would drop it from every tool
-/// at once, which is a silent loss of a page that exists on disk.
+/// Rust's `char::is_whitespace` follows Unicode `White_Space`; Python's
+/// `str.isspace`, which `\s` compiles to, additionally covers the four ASCII
+/// separators below `\x20` and `NEL`.
+fn is_python_whitespace(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '\u{1c}'..='\u{1f}' | '\u{85}')
+}
+
+/// Parses a frontmatter block, resolving repeated keys the way the reference
+/// loader does.
+///
+/// A repeated key is a hard parse error to a strict YAML parser, which would
+/// drop the page from every tool at once — a silent loss of a page that exists
+/// on disk. The reference resolves duplicates last-wins, so a failed parse is
+/// retried with repeats removed.
+///
+/// Only the *original* error is reported when the retry also fails, so
+/// genuinely malformed frontmatter still skips the page instead of being
+/// silently accepted in some mangled form.
 fn parse_yaml_block(block: &str) -> Result<Value, serde_yaml::Error> {
     match serde_yaml::from_str::<Value>(block) {
-        Err(error) if error.to_string().starts_with("duplicate entry with key") => {
-            match serde_yaml::from_str::<Value>(&dedupe_keys(block)) {
-                Ok(value) => Ok(value),
-                // A duplicate buried in a nested block is not worth a bespoke
-                // YAML editor; fall back to reporting the original failure.
-                Err(_) => Err(error),
-            }
-        }
+        Err(error) => serde_yaml::from_str::<Value>(&dedupe_keys(block)).map_err(|_| error),
         other => other,
     }
 }
 
-/// Returns the key of a top-level `key: value` line, or `None` for a line that
-/// belongs to a nested block or a list item.
-fn top_level_key(line: &str) -> Option<&str> {
-    if line.starts_with(char::is_whitespace) || line.trim_start().starts_with('-') {
-        return None;
-    }
-    let colon = line.find(':')?;
-    let key = line[..colon].trim_end();
-    (!key.is_empty() && !key.starts_with(char::is_whitespace)).then_some(key)
-}
-
-/// Removes earlier repeats of a top-level key, leaving the last occurrence.
+/// Removes repeated mapping keys, keeping the last value for each.
 ///
-/// Operates on the raw block because a duplicate-key error carries no position
-/// information, and a top-level repeat is the shape a hand-written frontmatter
-/// actually has. Lines that are indented or start a list item belong to a
-/// nested structure and are left untouched.
+/// Works on the raw block rather than on a parsed value, because a duplicate-key
+/// error carries no position, and because a text pass can drop a key together
+/// with its indented value block — dropping only the key line would orphan the
+/// value and produce invalid YAML in turn.
+///
+/// Keys are scoped by their enclosing mapping, so `title:` repeated at the top
+/// level and `title:` repeated inside a nested mapping are separate keys, as
+/// they are to a YAML parser.
+///
+/// Two shapes are out of reach for a line-based pass and are therefore left to
+/// the parser, which rejects them and skips the page: a repeat nested inside a
+/// multi-line flow collection, and a repeat inside a list item's own mapping
+/// (`items:\n  - name: a\n    name: b`). Both require frontmatter that is
+/// already malformed and that no wiki page contains.
 fn dedupe_keys(block: &str) -> String {
     let lines: Vec<&str> = block.split('\n').collect();
+    let mut dropped = vec![false; lines.len()];
 
-    let key_at = top_level_key;
+    // Indentation of each open mapping and the key path leading to it, so two
+    // `title:` lines at different depths are not mistaken for a repeat.
+    let mut open: Vec<(usize, String)> = Vec::new();
+    let mut last_seen: HashMap<(Vec<String>, String), (usize, usize)> = HashMap::new();
 
-    // First pass: where each top-level key last appears.
-    let mut last_index_of: Vec<(&str, usize)> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
-        if let Some(key) = key_at(line) {
-            match last_index_of.iter_mut().find(|(name, _)| *name == key) {
-                Some(slot) => slot.1 = index,
-                None => last_index_of.push((key, index)),
+        let Some((key, indent)) = mapping_key(line) else {
+            continue;
+        };
+
+        while open.last().is_some_and(|(depth, _)| *depth >= indent) {
+            open.pop();
+        }
+        let scope: Vec<String> = open.iter().map(|(_, key)| key.clone()).collect();
+
+        // The key's value runs until the next line indented no further. Blank
+        // lines are carried along because they are not scope-defining.
+        let mut end = index + 1;
+        while end < lines.len() {
+            let next = lines[end];
+            let next_indent = next.len() - next.trim_start().len();
+            if next.trim().is_empty() || next_indent > indent {
+                end += 1;
+            } else {
+                break;
             }
         }
+
+        // Drop the whole earlier entry, key line and indented value alike.
+        if let Some(&(start, previous_end)) = last_seen.get(&(scope.clone(), key.to_string())) {
+            for line in dropped.iter_mut().take(previous_end).skip(start) {
+                *line = true;
+            }
+        }
+        last_seen.insert((scope, key.to_string()), (index, end));
+
+        open.push((indent, key.to_string()));
     }
 
-    // Second pass: drop every earlier line that carries a repeated key.
-    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
-    for (index, line) in lines.iter().enumerate() {
-        let repeated = key_at(line).is_some_and(|key| {
-            last_index_of
-                .iter()
-                .any(|(name, last)| *name == key && *last != index)
-        });
-        if !repeated {
-            kept.push(line);
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !dropped[*index])
+        .map(|(_, line)| *line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Returns the key and indentation of a block-mapping entry, or `None` for a
+/// line that is blank, a comment, a sequence item, or a multi-line flow value.
+fn mapping_key(line: &str) -> Option<(&str, usize)> {
+    let indent = line.len() - line.trim_start().len();
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let colon = trimmed.find(':')?;
+    let key = &trimmed[..colon];
+    if key.is_empty() || key.contains('#') {
+        return None;
+    }
+
+    // A flow collection whose brackets balance on this line is a single-line
+    // value, so the entry is exactly one line wide and safe to reason about.
+    // One that spans lines is left to the parser.
+    let rest = trimmed[colon + 1..].trim_start();
+    if (rest.starts_with('[') || rest.starts_with('{')) && !brackets_balance(rest) {
+        return None;
+    }
+
+    Some((key, indent))
+}
+
+/// Whether every bracket opened in a fragment is closed within it.
+fn brackets_balance(fragment: &str) -> bool {
+    let mut depth = 0i32;
+    for ch in fragment.chars() {
+        match ch {
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return false;
         }
     }
-
-    kept.join("\n")
+    depth == 0
 }
 
 /// Quotes bare `-` values in a frontmatter block.
@@ -421,7 +491,7 @@ pub fn page_title(page: &Page) -> String {
 /// relative to the body, so they stay meaningful after the frontmatter.
 pub fn extract_snippets(body: &str, terms: &[String]) -> Vec<String> {
     let mut scored: Vec<(usize, usize, &str)> = Vec::new();
-    for (index, line) in body.lines().enumerate() {
+    for (index, line) in python_lines(body).into_iter().enumerate() {
         let stripped = line.trim();
         if stripped.is_empty() {
             continue;
@@ -445,6 +515,40 @@ pub fn extract_snippets(body: &str, terms: &[String]) -> Vec<String> {
             format!("L{lineno}: {truncated}")
         })
         .collect()
+}
+
+/// Splits text into lines the way Python's `str.splitlines()` does.
+///
+/// Rust's `str::lines` breaks on `\n` alone. Python also breaks on `\v`, `\f`,
+/// the three ASCII information separators, `NEL`, and the Unicode line and
+/// paragraph separators. Snippets are numbered by line, so the two have to
+/// agree or a page containing one of those characters reports the wrong lines.
+fn python_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        let is_break = ch == '\r'
+            || ch == '\n'
+            || matches!(ch, '\u{0b}'..='\u{0c}' | '\u{1c}'..='\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}');
+        if !is_break {
+            continue;
+        }
+        lines.push(&text[start..index]);
+        let mut consumed = ch.len_utf8();
+        // `\r\n` is one break, not two.
+        if ch == '\r' && chars.peek().is_some_and(|(_, next)| *next == '\n') {
+            chars.next();
+            consumed += '\n'.len_utf8();
+        }
+        start = index + consumed;
+    }
+    // Python's splitlines does not yield a trailing empty line.
+    if start < text.len() {
+        lines.push(&text[start..]);
+    }
+    lines
 }
 
 /// Resolves a page name to a file path confined to the pages directory.
@@ -526,6 +630,77 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Dropping only the repeated key line would orphan an indented value and
+    /// make the retry invalid, which drops the page all over again.
+    #[test]
+    fn a_duplicate_key_with_a_block_value_keeps_the_page() {
+        let path = write_temp(
+            "dupblock.md",
+            "---\nservices:\n  - relay\n  - pump\nservices: manual\n---\nbody",
+        );
+        let page = parse_page_file(&path).expect("page survives a repeated block key");
+        assert_eq!(page.meta.get("services"), Some(&json!("manual")));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_duplicate_key_inside_a_nested_mapping_keeps_the_page() {
+        let path = write_temp(
+            "nesteddup.md",
+            "---\nmeta:\n  status: a\n  status: b\ntitle: X\n---\nbody",
+        );
+        let page = parse_page_file(&path).expect("page survives a repeated nested key");
+        assert_eq!(page.meta.get("meta"), Some(&json!({"status": "b"})));
+        assert_eq!(page.meta.get("title"), Some(&json!("X")));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The same key at two different depths is two different keys.
+    #[test]
+    fn keys_at_different_depths_are_not_repeats() {
+        let path = write_temp(
+            "depths.md",
+            "---\ntitle: Outer\nmeta:\n  title: Inner\n---\nbody",
+        );
+        let page = parse_page_file(&path).expect("page parses");
+        assert_eq!(page.meta.get("title"), Some(&json!("Outer")));
+        assert_eq!(page.meta.get("meta"), Some(&json!({"title": "Inner"})));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_repeated_single_line_flow_value_keeps_the_page() {
+        let path = write_temp(
+            "flowdup.md",
+            "---\ntags: [x, y]\ntags: [z]\ntype: debug\n---\nbody",
+        );
+        let page = parse_page_file(&path).expect("page survives a repeated flow list");
+        assert_eq!(page.meta.get("tags"), Some(&json!(["z"])));
+        assert_eq!(page.meta.get("type"), Some(&json!("debug")));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_repeated_block_sequence_keeps_the_page() {
+        let path = write_temp(
+            "seqdup.md",
+            "---\nrelated:\n  - a\n  - b\nrelated:\n  - c\n---\nbody",
+        );
+        let page = parse_page_file(&path).expect("page survives a repeated block sequence");
+        assert_eq!(page.meta.get("related"), Some(&json!(["c"])));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn frontmatter_that_is_only_invalid_still_skips_the_page() {
+        let path = write_temp("bad.md", "---\ntitle: [unclosed\n---\nbody");
+        assert!(parse_page_file(&path).is_none());
+        // Invalid *and* repeated: the retry must not rescue it either.
+        let path = write_temp("bad2.md", "---\na: 1\na: 2\nb: [x\n---\nbody");
+        assert!(parse_page_file(&path).is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
     /// The reference delimiter is `\A---\s*\n(.*?)\n---\s*\n?`, and each of
     /// these is a place where reading it as "a line containing exactly ---"
     /// gives a different answer.
@@ -563,6 +738,127 @@ mod tests {
         assert_eq!(page.meta.get("title"), Some(&json!("X")));
         assert_eq!(page.body, "");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// `\s*` is greedy but backtracks, so a blank line after the opener can
+    /// supply the delimiter's newline. Reading it as "the longest whitespace
+    /// run" instead shifts every body line number and indexes the `---` lines
+    /// as body text, which perturbs the length normalization for every query.
+    #[test]
+    fn a_blank_line_after_the_opener_still_closes_the_block() {
+        let path = write_temp("blankfm.md", "---\n\n---\n# Relay mode\n\nrelay text\n");
+        let page = parse_page_file(&path).expect("page parses");
+        assert!(page.meta.is_empty());
+        assert_eq!(page.body, "# Relay mode\n\nrelay text\n");
+        assert_eq!(
+            extract_snippets(&page.body, &["relay".to_string()]),
+            ["L1: # Relay mode", "L3: relay text"]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_file_that_is_only_a_delimiter_has_no_frontmatter() {
+        let path = write_temp("justfence.md", "---\n");
+        let page = parse_page_file(&path).expect("page parses");
+        assert!(page.meta.is_empty());
+        assert_eq!(page.body, "---\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Every row is a `(file, block, body)` triple taken from the reference
+    /// regex `\A---\s*\n(.*?)\n---\s*\n?`. `None` means no frontmatter at all.
+    ///
+    /// The interesting rows are the ones where reading the delimiter as "a line
+    /// containing exactly ---" gives a different answer, and the ones where
+    /// `\s*` has to backtrack rather than take the whole run.
+    #[test]
+    fn the_frontmatter_delimiter_matches_the_reference_regex() {
+        type Expected<'a> = Option<(&'a str, &'a str)>;
+        let cases: &[(&str, Expected)] = &[
+            // The opening `---` cannot also close the block.
+            ("---\n---\nrelay\n", None),
+            // ...unless a blank line's own newline can serve as the delimiter's.
+            (
+                "---\n\n---\n# Relay mode\n\nrelay text\n",
+                Some(("", "# Relay mode\n\nrelay text\n")),
+            ),
+            ("---\n\n\n---\nbody\n", Some(("", "body\n"))),
+            // The closing fence need not end its line, nor be exactly `---`.
+            (
+                "---\ntitle: x\n---foo\nbody\n",
+                Some(("title: x", "foo\nbody\n")),
+            ),
+            (
+                "---\ntitle: X\n----\nbody\n",
+                Some(("title: X", "-\nbody\n")),
+            ),
+            ("---\ntitle: X\n---", Some(("title: X", ""))),
+            // An indented fence is not a fence.
+            ("---\ntitle: x\n  ---\nbody\n", None),
+            ("---\ntitle: X\n---\nbody", Some(("title: X", "body"))),
+            // `\s*` backtracks off trailing spaces and tabs to find the newline.
+            ("---\n   \n---\nbody\n", Some(("   ", "body\n"))),
+            (
+                "---\n title: X\ntype: impl\n---\nbody\n",
+                Some((" title: X\ntype: impl", "body\n")),
+            ),
+            (
+                "---\n\ttitle: X\n---\nbody\n",
+                Some(("\ttitle: X", "body\n")),
+            ),
+            (
+                "---   \ntitle: X\n---\nbody\n",
+                Some(("title: X", "body\n")),
+            ),
+            ("---\n   ---\n\n\n\n---\n", Some(("   ---\n\n\n", ""))),
+            // `\s*\n?` after the closing fence eats every blank line.
+            (
+                "---\ntitle: X\n---   \n\n\nbody\n",
+                Some(("title: X", "body\n")),
+            ),
+            (
+                "---\ntitle: X\n---\n\n\n\nbody\n",
+                Some(("title: X", "body\n")),
+            ),
+            // Whitespace classes Rust's `char::is_whitespace` alone would miss. The
+            // delimiter still closes here; treating these as ordinary content
+            // characters would leave the page with no frontmatter at all.
+            (
+                "---\n\u{a0}\ntitle: X\n---\nbody\n",
+                Some(("title: X", "body\n")),
+            ),
+            (
+                "---\n\u{c}\ntitle: X\n---\nbody\n",
+                Some(("title: X", "body\n")),
+            ),
+            // Unterminated or absent.
+            ("---\n", None),
+            ("no frontmatter\n", None),
+        ];
+
+        for (text, expected) in cases {
+            match split_frontmatter(text) {
+                None => assert!(expected.is_none(), "{text:?} should have no frontmatter"),
+                Some((block, offset)) => {
+                    let (want_block, want_body) = expected.expect("expected no frontmatter");
+                    assert_eq!(block, want_block, "block of {text:?}");
+                    assert_eq!(&text[offset..], want_body, "body of {text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lines_split_the_way_python_splits_them() {
+        // Python's splitlines also breaks on these; Rust's `lines` does not, and
+        // snippet line numbers are counted off the split.
+        assert_eq!(
+            python_lines("a\nb\u{c}c\u{b}d\u{85}e\u{2028}f\r\ng"),
+            ["a", "b", "c", "d", "e", "f", "g"]
+        );
+        assert_eq!(python_lines("trailing\n"), ["trailing"]);
+        assert_eq!(python_lines(""), Vec::<&str>::new());
     }
 
     #[test]

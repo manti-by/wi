@@ -176,23 +176,37 @@ The relay mode is computed on read, not stored.
 Frontmatter is optional. `title`, `type`, `date` and `status` are for display;
 `tags`, `services`, `areas`, `tickets` and `type` are also searched. A bare `-`
 is read as the literal string rather than as YAML null, so `branch: -` means "no
-branch". A page whose frontmatter is invalid YAML, or is not a mapping, is
-skipped with a warning rather than served half-parsed. A repeated key keeps its
-last value, the way YAML normally resolves it, rather than invalidating the page.
-Carriage returns are normalized on read, so a page edited on Windows gets the
-same line numbers as one edited on Linux.
+branch". Carriage returns are normalized on read, so a page edited on Windows
+gets the same line numbers as one edited on Linux. A page whose frontmatter is
+invalid YAML, or is not a mapping, is skipped with a warning rather than served
+half-parsed.
+
+A repeated key keeps its last value, the way YAML normally resolves it, rather
+than invalidating the page — at the top level, inside a nested mapping, and for
+both block and single-line flow values. Two malformed shapes remain out of reach
+of that pass and are skipped like any other invalid frontmatter: a repeat
+nested inside a multi-line flow collection, and a repeat inside a list item's
+own mapping.
 
 `wiki_get_page` resolves a name against the pages root: the `.md` suffix is
 optional, a leading `pages/` is stripped, and anything that resolves outside the
 root — through `..`, an absolute path, or a symlink — is refused.
 
-### Known divergence from the Python original
+### Known divergences from the Python original
 
 The Python implementation resolves frontmatter with PyYAML, which implements
-YAML 1.1; this binary uses a 1.2 parser. A bare `yes`, `no`, `on` or `off` used
-as a whole value therefore reads as the string here and as `True`/`False` there —
-`status: yes` displays `status: yes` instead of `status: True`. Quoting the value
-(`status: "yes"`) makes both agree. Everything else in the page format matches.
+YAML 1.1; this binary uses a 1.2 parser. Two consequences, both on values that
+have to be quoted anyway if you want them stable:
+
+- A bare `yes`, `no`, `on` or `off` is the string here and the boolean `True` or
+  `False` there, so `status: yes` displays `status: yes` rather than
+  `status: True`.
+- YAML 1.1 octal resolves differently: `01` is the integer `1` there and the
+  string `01` here. `.nan` is a float there — and therefore truthy, and
+  therefore displayed and indexed — and null here.
+
+Quote the value (`status: "yes"`, `rev: "01"`) and both implementations agree.
+Everything else about the page format matches.
 
 ## Development
 
