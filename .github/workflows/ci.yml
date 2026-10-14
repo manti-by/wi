@@ -1,0 +1,58 @@
+name: ci
+
+# Every push and every pull request runs the same gate as `make check`, so the
+# release workflow can trust the tree it publishes. `install.sh` gets its own
+# syntax check and an offline end-to-end smoke test here.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt, clippy and tests
+        run: make check
+
+      - name: Check shell syntax
+        run: |
+          sh -n install.sh
+          for script in .github/scripts/*.sh; do bash -n "$script"; done
+
+      - name: Lint shell
+        run: .github/scripts/lint-shell.sh
+
+      - name: Installer help
+        run: ./install.sh --help
+
+      - name: Installer smoke test
+        run: .github/scripts/smoke-installer.sh
+
+  mcp:
+    # The unit tests cover the ranking and parsing; this job proves the binary
+    # still speaks MCP over HTTP, which no unit test can see.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Smoke-test the MCP endpoint
+        run: make smoke

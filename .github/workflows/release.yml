@@ -1,0 +1,128 @@
+name: release
+
+# Publishes a GitHub release when the package version in Cargo.toml changes on
+# `master`. A manual `workflow_dispatch` re-runs the publish even without a
+# version change, which is how a failed release is retried.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Two pushes to `master` must not race to publish the same tag. The lock is not
+# cancelled once held, so an in-flight release always finishes.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt, clippy and tests
+        run: make check
+
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.detect.outputs.changed }}
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # BEFORE and EVENT_NAME come in through `env:` rather than a direct
+      # `${{ … }}` interpolation, per GitHub's script-injection hardening guide.
+      - name: Detect a version bump
+        id: detect
+        env:
+          BEFORE: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: .github/scripts/detect-version.sh
+
+  build:
+    needs: [check, version]
+    if: needs.version.outputs.changed == 'true'
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            asset: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            asset: linux-aarch64
+          # `macos-15-intel` is the current standard x86_64 macOS label. The old
+          # `macos-13` was retired, so it must not be used.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            asset: macos-x86_64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            asset: macos-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: .github/scripts/package.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wi-${{ matrix.asset }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [build, version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # The scripts below live in the repo, so the tree has to be here. Checkout
+      # runs before the download because it cleans the workspace by default.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wi-*
+          merge-multiple: true
+
+      - name: Checksums
+        run: .github/scripts/checksums.sh
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: .github/scripts/publish.sh

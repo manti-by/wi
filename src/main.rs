@@ -1,0 +1,203 @@
+//! `wi` — an MCP server over a directory of Markdown wiki pages.
+//!
+//! One binary, no configuration file: point it at a pages directory and it
+//! serves three tools that let an agent search the wiki, read a page, and list
+//! what is there. Search is BM25F across the title, metadata and body of every
+//! page, with the corpus cached and invalidated on file changes.
+
+mod config;
+mod corpus;
+mod error;
+mod page;
+mod search;
+mod tools;
+
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use clap::Parser;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use tracing_subscriber::EnvFilter;
+
+use crate::error::ServeError;
+use crate::tools::WikiService;
+
+/// The MCP protocol revision this server advertises.
+pub const PROTOCOL_VERSION: rmcp::model::ProtocolVersion = rmcp::model::ProtocolVersion::LATEST;
+
+/// Port the server listens on when none is given.
+const DEFAULT_PORT: u16 = 4321;
+
+/// Interface the server binds when none is given.
+///
+/// Loopback by default: this serves a local project's private notes, so it
+/// should not be reachable from the network unless the operator asks for that.
+const DEFAULT_HOST: &str = "127.0.0.1";
+
+/// Pages directory used when `--wiki-path` is omitted.
+const DEFAULT_WIKI_PATH: &str = "wiki/pages";
+
+/// Serve a Markdown wiki over the Model Context Protocol.
+#[derive(Debug, Parser)]
+#[command(
+    name = "wi",
+    version,
+    about = "Serve a Markdown wiki over MCP",
+    long_about = "Serve a Markdown wiki over MCP.\n\n\
+                  Runs an MCP server that exposes the wiki_search, wiki_get_page and \
+                  wiki_list_pages tools over Streamable HTTP. Search ranks pages with BM25F \
+                  across each page's title, metadata and body."
+)]
+struct Args {
+    /// Interface to bind.
+    #[arg(long, default_value = DEFAULT_HOST, value_name = "HOST")]
+    host: String,
+
+    /// Port to bind.
+    #[arg(long, default_value_t = DEFAULT_PORT, value_name = "PORT")]
+    port: u16,
+
+    /// Directory holding the `*.md` wiki pages.
+    #[arg(long, default_value = DEFAULT_WIKI_PATH, value_name = "PATH")]
+    wiki_path: PathBuf,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    init_tracing()?;
+
+    let root = resolve_wiki_path(&args.wiki_path)?;
+    if !root.is_dir() {
+        return Err(match root.is_file() {
+            true => ServeError::NotADirectory(root).into(),
+            false => ServeError::PagesNotFound(root).into(),
+        });
+    }
+
+    serve(wiki_host(&args.host)?, args.port, root).await
+}
+
+/// Resolves the pages root to an absolute path.
+///
+/// Making it absolute once, at startup, means later containment checks compare
+/// two canonical paths regardless of the process's working directory.
+fn resolve_wiki_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    // Falls back to the unresolved path when the directory does not exist yet,
+    // so the caller reports the path the operator actually typed.
+    Ok(absolute.canonicalize().unwrap_or(absolute))
+}
+
+/// Parses `--host` into a socket address.
+///
+/// Bare hostnames resolve through DNS, so `localhost` and a machine's own name
+/// both work; unresolvable names are reported before the server starts rather
+/// than as a confusing bind failure.
+fn wiki_host(host: &str) -> anyhow::Result<IpAddr> {
+    use std::net::ToSocketAddrs;
+
+    (host, 0)
+        .to_socket_addrs()
+        .map_err(|error| ServeError::Bind {
+            host: host.to_string(),
+            port: DEFAULT_PORT,
+            source: error,
+        })?
+        .next()
+        .map(|address| address.ip())
+        .ok_or_else(|| {
+            ServeError::Bind {
+                host: host.to_string(),
+                port: DEFAULT_PORT,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "host did not resolve to an address",
+                ),
+            }
+            .into()
+        })
+}
+
+/// Starts the HTTP server and serves until it is shut down.
+async fn serve(address: IpAddr, port: u16, root: PathBuf) -> anyhow::Result<()> {
+    let address = SocketAddr::new(address, port);
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|source| ServeError::Bind {
+            host: address.ip().to_string(),
+            port,
+            source,
+        })?;
+
+    let bound = listener.local_addr()?;
+    tracing::info!(%bound, wiki_path = %root.display(), "wi listening");
+
+    // The factory is called once per MCP session. Each handler owns a handle on
+    // the same directory, and the corpus cache is rebuilt per handler, which
+    // costs one directory scan per session rather than per query.
+    let factory_root = root.clone();
+    let service = StreamableHttpService::new(
+        move || Ok(WikiService::new(factory_root.clone())),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+
+    // MCP clients post to `/mcp`, but the transport owns its own routing and
+    // discovery, so the service is mounted as a fallback rather than pinned to
+    // a path a client might get wrong.
+    let app = axum::Router::new().fallback_service(service);
+
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(ServeError::Serve)?;
+
+    tracing::info!("wi stopped");
+    Ok(())
+}
+
+/// Resolves when the process is asked to stop.
+async fn shutdown_signal() {
+    let interrupt = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = interrupt => tracing::info!("received SIGINT, shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
+}
+
+/// Initializes logging to stderr.
+///
+/// stdout and stderr are both ordinary streams here rather than a JSON-RPC
+/// channel, but stderr is still the right home for logs: it keeps them out of
+/// the way of anything a user pipes the process into.
+fn init_tracing() -> Result<(), ServeError> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init()
+        .map_err(ServeError::Logging)
+}

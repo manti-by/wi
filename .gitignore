@@ -1,0 +1,11 @@
+# Build artifacts. Cargo.lock is deliberately NOT ignored: wi is a binary, so
+# the committed lockfile is what makes `--locked` builds reproducible.
+/target
+
+# Release archives, written by .github/scripts/package.sh.
+/dist/
+
+.DS_Store
+*.swp
+.idea/
+.vscode/
