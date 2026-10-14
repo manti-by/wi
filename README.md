@@ -182,11 +182,14 @@ invalid YAML, or is not a mapping, is skipped with a warning rather than served
 half-parsed.
 
 A repeated key keeps its last value, the way YAML normally resolves it, rather
-than invalidating the page — at the top level, inside a nested mapping, and for
-both block and single-line flow values. Two malformed shapes remain out of reach
-of that pass and are skipped like any other invalid frontmatter: a repeat
-nested inside a multi-line flow collection, and a repeat inside a list item's
-own mapping.
+than invalidating the page — at any depth, inside a nested mapping, a flow
+collection, or a list item's own mapping. Handling that needed three attempts,
+and the shape of the final one is the interesting part: the first matched on the
+parser's error text, which misses nested repeats because the message is prefixed
+with the key path; the second rewrote the block textually, which orphans an
+indented value when only the key line is dropped, is cubic in nesting depth, and
+cannot tell where a multi-line flow value ends. Mapping construction now
+overwrites in the deserializer instead, which needs no text heuristics at all.
 
 `wiki_get_page` resolves a name against the pages root: the `.md` suffix is
 optional, a leading `pages/` is stripped, and anything that resolves outside the
@@ -202,10 +205,13 @@ have to be quoted anyway if you want them stable:
   `False` there, so `status: yes` displays `status: yes` rather than
   `status: True`.
 - YAML 1.1 octal resolves differently: `01` is the integer `1` there and the
-  string `01` here. `.nan` is a float there — and therefore truthy, and
-  therefore displayed and indexed — and null here.
+  string `01` here.
 
 Quote the value (`status: "yes"`, `rev: "01"`) and both implementations agree.
+Integers beyond 64 bits and frontmatter nested more than about 128 levels deep
+are also outside what the YAML parser here accepts; such a page is skipped with a
+warning, the same as any other unparseable frontmatter.
+
 Everything else about the page format matches.
 
 ## Development

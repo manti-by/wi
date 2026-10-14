@@ -96,12 +96,14 @@ impl CorpusCache {
 
         match built {
             Ok(corpus) => Arc::clone(cached.insert(corpus)),
-            // A panicking parse must not take every later tool call with it, and
-            // the fallback is cached so a recurring panic cannot turn into a
-            // rebuild on every call.
+            // A panicking parse must not take every later tool call with it. The
+            // fallback is built from the fingerprint that was just taken, so it
+            // caches like any other snapshot: an empty one would never match
+            // again and a recurring panic would rebuild on every single call.
             Err(error) => {
                 tracing::error!(%error, "corpus rebuild panicked; serving an empty wiki");
-                Arc::clone(cached.insert(build_corpus(&root, Vec::new())))
+                let fallback = build_corpus(&root, fingerprint);
+                Arc::clone(cached.insert(fallback))
             }
         }
     }

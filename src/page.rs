@@ -5,10 +5,11 @@
 //! search snippets — is derived here, so the three tools cannot disagree about
 //! how a page reads.
 
-use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
-use serde_yaml::Value;
+use serde::Deserialize;
+use serde::de::{MapAccess, SeqAccess, Visitor};
 
 use crate::config;
 use crate::search::{Field, FieldCounts, count_field, line_hits};
@@ -78,22 +79,29 @@ fn scalar_to_string(value: &serde_json::Value) -> String {
         serde_json::Value::String(text) => text.clone(),
         serde_json::Value::Array(items) => format!(
             "[{}]",
-            items.iter().map(python_repr).collect::<Vec<_>>().join(", ")
+            items
+                .iter()
+                .map(python_repr_value)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         serde_json::Value::Object(map) => format!(
             "{{{}}}",
             map.iter()
-                .map(|(key, value)| format!("'{}': {}", key, scalar_to_string(value)))
+                .map(|(key, value)| {
+                    format!("{}: {}", python_repr_str(key), python_repr_value(value))
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
     }
 }
 
-/// Renders a string the way Python's `repr()` would, single-quoted.
-fn python_repr(value: &serde_json::Value) -> String {
+/// Renders a value the way Python's `repr()` would, which is what a container
+/// applies to the values nested inside it.
+fn python_repr_value(value: &serde_json::Value) -> String {
     match value {
-        serde_json::Value::String(text) => format!("'{text}'"),
+        serde_json::Value::String(text) => python_repr_str(text),
         other => scalar_to_string(other),
     }
 }
@@ -140,7 +148,7 @@ pub fn parse_page_file(path: &Path) -> Option<Page> {
     };
 
     let block = rescue_bare_dashes(block);
-    let parsed = match parse_yaml_block(&block) {
+    let parsed = match parse_frontmatter(&block) {
         Ok(parsed) => parsed,
         Err(error) => {
             tracing::warn!(page = %name, %error, "skipping page with invalid frontmatter");
@@ -149,10 +157,12 @@ pub fn parse_page_file(path: &Path) -> Option<Page> {
     };
 
     let meta = match parsed {
-        Value::Null => serde_json::Map::new(),
-        Value::Mapping(mapping) => yaml_mapping_to_json(mapping),
-        _ => {
-            tracing::warn!(page = %name, "skipping page with non-mapping frontmatter");
+        serde_json::Value::Object(meta) => meta,
+        other => {
+            tracing::warn!(
+                page = %name,
+                "skipping page with non-mapping frontmatter: {other}"
+            );
             return None;
         }
     };
@@ -235,134 +245,6 @@ fn is_python_whitespace(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '\u{1c}'..='\u{1f}' | '\u{85}')
 }
 
-/// Parses a frontmatter block, resolving repeated keys the way the reference
-/// loader does.
-///
-/// A repeated key is a hard parse error to a strict YAML parser, which would
-/// drop the page from every tool at once — a silent loss of a page that exists
-/// on disk. The reference resolves duplicates last-wins, so a failed parse is
-/// retried with repeats removed.
-///
-/// Only the *original* error is reported when the retry also fails, so
-/// genuinely malformed frontmatter still skips the page instead of being
-/// silently accepted in some mangled form.
-fn parse_yaml_block(block: &str) -> Result<Value, serde_yaml::Error> {
-    match serde_yaml::from_str::<Value>(block) {
-        Err(error) => serde_yaml::from_str::<Value>(&dedupe_keys(block)).map_err(|_| error),
-        other => other,
-    }
-}
-
-/// Removes repeated mapping keys, keeping the last value for each.
-///
-/// Works on the raw block rather than on a parsed value, because a duplicate-key
-/// error carries no position, and because a text pass can drop a key together
-/// with its indented value block — dropping only the key line would orphan the
-/// value and produce invalid YAML in turn.
-///
-/// Keys are scoped by their enclosing mapping, so `title:` repeated at the top
-/// level and `title:` repeated inside a nested mapping are separate keys, as
-/// they are to a YAML parser.
-///
-/// Two shapes are out of reach for a line-based pass and are therefore left to
-/// the parser, which rejects them and skips the page: a repeat nested inside a
-/// multi-line flow collection, and a repeat inside a list item's own mapping
-/// (`items:\n  - name: a\n    name: b`). Both require frontmatter that is
-/// already malformed and that no wiki page contains.
-fn dedupe_keys(block: &str) -> String {
-    let lines: Vec<&str> = block.split('\n').collect();
-    let mut dropped = vec![false; lines.len()];
-
-    // Indentation of each open mapping and the key path leading to it, so two
-    // `title:` lines at different depths are not mistaken for a repeat.
-    let mut open: Vec<(usize, String)> = Vec::new();
-    let mut last_seen: HashMap<(Vec<String>, String), (usize, usize)> = HashMap::new();
-
-    for (index, line) in lines.iter().enumerate() {
-        let Some((key, indent)) = mapping_key(line) else {
-            continue;
-        };
-
-        while open.last().is_some_and(|(depth, _)| *depth >= indent) {
-            open.pop();
-        }
-        let scope: Vec<String> = open.iter().map(|(_, key)| key.clone()).collect();
-
-        // The key's value runs until the next line indented no further. Blank
-        // lines are carried along because they are not scope-defining.
-        let mut end = index + 1;
-        while end < lines.len() {
-            let next = lines[end];
-            let next_indent = next.len() - next.trim_start().len();
-            if next.trim().is_empty() || next_indent > indent {
-                end += 1;
-            } else {
-                break;
-            }
-        }
-
-        // Drop the whole earlier entry, key line and indented value alike.
-        if let Some(&(start, previous_end)) = last_seen.get(&(scope.clone(), key.to_string())) {
-            for line in dropped.iter_mut().take(previous_end).skip(start) {
-                *line = true;
-            }
-        }
-        last_seen.insert((scope, key.to_string()), (index, end));
-
-        open.push((indent, key.to_string()));
-    }
-
-    lines
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !dropped[*index])
-        .map(|(_, line)| *line)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Returns the key and indentation of a block-mapping entry, or `None` for a
-/// line that is blank, a comment, a sequence item, or a multi-line flow value.
-fn mapping_key(line: &str) -> Option<(&str, usize)> {
-    let indent = line.len() - line.trim_start().len();
-    let trimmed = line.trim_start();
-    if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.starts_with('#') {
-        return None;
-    }
-
-    let colon = trimmed.find(':')?;
-    let key = &trimmed[..colon];
-    if key.is_empty() || key.contains('#') {
-        return None;
-    }
-
-    // A flow collection whose brackets balance on this line is a single-line
-    // value, so the entry is exactly one line wide and safe to reason about.
-    // One that spans lines is left to the parser.
-    let rest = trimmed[colon + 1..].trim_start();
-    if (rest.starts_with('[') || rest.starts_with('{')) && !brackets_balance(rest) {
-        return None;
-    }
-
-    Some((key, indent))
-}
-
-/// Whether every bracket opened in a fragment is closed within it.
-fn brackets_balance(fragment: &str) -> bool {
-    let mut depth = 0i32;
-    for ch in fragment.chars() {
-        match ch {
-            '[' | '{' => depth += 1,
-            ']' | '}' => depth -= 1,
-            _ => {}
-        }
-        if depth < 0 {
-            return false;
-        }
-    }
-    depth == 0
-}
-
 /// Quotes bare `-` values in a frontmatter block.
 ///
 /// `branch: -` is legal YAML for null, but in a wiki it means the literal
@@ -376,6 +258,11 @@ fn rescue_bare_dashes(block: &str) -> String {
 }
 
 /// Rewrites a single `key: -` line, leaving every other line untouched.
+///
+/// Mirrors `^(\s*[A-Za-z_][\w]*\s*:\s*)-$` exactly: the dash has to be the last
+/// thing on the line, so `branch: - ` is left alone and goes on to fail as the
+/// invalid YAML it is. The first character of the key is ASCII-only while the
+/// rest of it is any Unicode word character, which is what Python's `\w` means.
 fn rescue_bare_dash_line(line: &str) -> String {
     let indent_len = line.len() - line.trim_start().len();
     let (indent, rest) = line.split_at(indent_len);
@@ -385,14 +272,12 @@ fn rescue_bare_dash_line(line: &str) -> String {
     let key = rest[..colon].trim_end();
     let after = &rest[colon + 1..];
 
-    let mut key_chars = key.chars();
-    let key_is_identifier = key_chars
+    let mut characters = key.chars();
+    let key_is_identifier = characters
         .next()
         .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-        && key
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
-    if !key_is_identifier || after.trim() != "-" {
+        && characters.all(|ch| ch.is_alphanumeric() || ch == '_');
+    if !key_is_identifier || after.trim_start() != "-" {
         return line.to_string();
     }
 
@@ -401,38 +286,231 @@ fn rescue_bare_dash_line(line: &str) -> String {
     format!("{indent}{key}:{gap}\"-\"")
 }
 
-/// Converts a YAML mapping into the JSON value model used for page metadata.
-fn yaml_mapping_to_json(
-    mapping: serde_yaml::Mapping,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    for (key, value) in mapping {
-        let key = match key {
-            Value::String(text) => text,
-            other => scalar_to_string(&yaml_to_json(&other)),
-        };
-        map.insert(key, yaml_to_json(&value));
+/// Parses a frontmatter block into the JSON value model, resolving repeated
+/// keys the way the reference loader does.
+///
+/// A repeated key is a hard parse error to a strict YAML parser, which would
+/// drop the page from every tool at once — a silent loss of a page that exists
+/// on disk. The reference resolves duplicates last-wins at every level, so
+/// rather than trying to detect and repair the text, the mapping is built here
+/// with a visitor that overwrites. That is correct at any nesting depth and for
+/// any spelling, including a repeat inside a nested mapping, inside a flow
+/// collection, or inside a list item's own mapping.
+///
+/// Frontmatter that is genuinely invalid still fails, and the page is skipped.
+fn parse_frontmatter(block: &str) -> Result<serde_json::Value, serde_yaml::Error> {
+    // An empty block parses as null, which the reference treats as an empty
+    // mapping rather than as a non-mapping document.
+    if block.trim().is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
     }
-    map
+    serde_yaml::from_str::<MetaValue>(block).map(MetaValue::into_json)
 }
 
-/// Converts any YAML value into the JSON value model.
-fn yaml_to_json(value: &Value) -> serde_json::Value {
-    match value {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(flag) => serde_json::Value::Bool(*flag),
-        Value::Number(number) => number
-            .as_i64()
-            .map(serde_json::Value::from)
-            .or_else(|| number.as_f64().map(serde_json::Value::from))
-            .unwrap_or(serde_json::Value::Null),
-        Value::String(text) => serde_json::Value::String(text.clone()),
-        Value::Sequence(items) => {
-            serde_json::Value::Array(items.iter().map(yaml_to_json).collect())
+/// A YAML value in the shape the tools need.
+///
+/// Written out rather than reusing `serde_yaml::Value` because the whole point
+/// is how mappings are built: `serde_yaml::Value` rejects a repeated key, and
+/// this visitor accepts one.
+#[derive(Debug)]
+enum MetaValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    Str(String),
+    Seq(Vec<MetaValue>),
+    /// Insertion-ordered, with a repeated key overwriting in place so the key
+    /// keeps its original position.
+    Map(Vec<(String, MetaValue)>),
+}
+
+impl<'de> Deserialize<'de> for MetaValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MetaVisitor;
+
+        impl<'de> Visitor<'de> for MetaVisitor {
+            type Value = MetaValue;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("any frontmatter value")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(MetaValue::Null)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(MetaValue::Null)
+            }
+
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                MetaValue::deserialize(deserializer)
+            }
+
+            fn visit_bool<E>(self, flag: bool) -> Result<Self::Value, E> {
+                Ok(MetaValue::Bool(flag))
+            }
+
+            fn visit_i64<E>(self, number: i64) -> Result<Self::Value, E> {
+                Ok(MetaValue::Int(number))
+            }
+
+            fn visit_u64<E>(self, number: u64) -> Result<Self::Value, E> {
+                Ok(MetaValue::UInt(number))
+            }
+
+            fn visit_f64<E>(self, number: f64) -> Result<Self::Value, E> {
+                Ok(MetaValue::Float(number))
+            }
+
+            fn visit_str<E>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(MetaValue::Str(text.to_string()))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = access.next_element()? {
+                    items.push(item);
+                }
+                Ok(MetaValue::Seq(items))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+                let mut entries: Vec<(String, MetaValue)> = Vec::new();
+                while let Some(key) = access.next_key::<MetaValue>()? {
+                    let value = access.next_value()?;
+                    // Last one wins, which is what YAML specifies and what the
+                    // reference loader does.
+                    match entries.iter_mut().find(|(name, _)| *name == key.as_key()) {
+                        Some(slot) => slot.1 = value,
+                        None => entries.push((key.as_key(), value)),
+                    }
+                }
+                Ok(MetaValue::Map(entries))
+            }
         }
-        Value::Mapping(mapping) => serde_json::Value::Object(yaml_mapping_to_json(mapping.clone())),
-        Value::Tagged(tagged) => yaml_to_json(&tagged.value),
+
+        deserializer.deserialize_any(MetaVisitor)
     }
+}
+
+impl MetaValue {
+    /// The key a mapping entry is filed under.
+    fn as_key(&self) -> String {
+        match self {
+            MetaValue::Str(text) => text.clone(),
+            other => other.to_display(),
+        }
+    }
+
+    /// Renders the value the way Python's `str()` would.
+    fn to_display(&self) -> String {
+        match self {
+            MetaValue::Null => "None".to_string(),
+            MetaValue::Bool(flag) => if *flag { "True" } else { "False" }.to_string(),
+            MetaValue::Int(number) => number.to_string(),
+            MetaValue::UInt(number) => number.to_string(),
+            MetaValue::Float(number) => python_float_str(*number),
+            MetaValue::Str(text) => text.clone(),
+            MetaValue::Seq(items) => {
+                let rendered: Vec<String> = items.iter().map(MetaValue::to_repr).collect();
+                format!("[{}]", rendered.join(", "))
+            }
+            MetaValue::Map(entries) => {
+                let rendered: Vec<String> = entries
+                    .iter()
+                    .map(|(key, value)| format!("{}: {}", python_repr_str(key), value.to_repr()))
+                    .collect();
+                format!("{{{}}}", rendered.join(", "))
+            }
+        }
+    }
+
+    /// Renders the value the way Python's `repr()` would, which is what a
+    /// container applies to the values inside it.
+    fn to_repr(&self) -> String {
+        match self {
+            MetaValue::Str(text) => python_repr_str(text),
+            other => other.to_display(),
+        }
+    }
+
+    fn into_json(self) -> serde_json::Value {
+        match self {
+            MetaValue::Null => serde_json::Value::Null,
+            MetaValue::Bool(flag) => serde_json::Value::Bool(flag),
+            MetaValue::Int(number) => serde_json::Value::from(number),
+            MetaValue::UInt(number) => serde_json::Value::from(number),
+            // JSON cannot represent infinity or NaN, and both are truthy and
+            // rendered and indexed as `inf` and `nan`, so they are carried as
+            // the strings Python would print.
+            MetaValue::Float(number) if !number.is_finite() => {
+                serde_json::Value::String(python_float_str(number))
+            }
+            MetaValue::Float(number) => serde_json::Number::from_f64(number)
+                .map_or(serde_json::Value::Null, serde_json::Value::Number),
+            MetaValue::Str(text) => serde_json::Value::String(text),
+            MetaValue::Seq(items) => {
+                serde_json::Value::Array(items.into_iter().map(MetaValue::into_json).collect())
+            }
+            MetaValue::Map(entries) => serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, value.into_json()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Renders a float the way Python's `str()` spells it.
+fn python_float_str(number: f64) -> String {
+    if number.is_nan() {
+        return "nan".to_string();
+    }
+    if number.is_infinite() {
+        return if number.is_sign_negative() {
+            "-inf"
+        } else {
+            "inf"
+        }
+        .to_string();
+    }
+    number.to_string()
+}
+
+/// Renders a string the way Python's `repr()` would.
+fn python_repr_str(text: &str) -> String {
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+
+    let mut body = String::with_capacity(text.len() + 2);
+    for ch in text.chars() {
+        match ch {
+            '\\' => body.push_str("\\\\"),
+            '\n' => body.push_str("\\n"),
+            '\r' => body.push_str("\\r"),
+            '\t' => body.push_str("\\t"),
+            c if c == quote => {
+                body.push('\\');
+                body.push(c);
+            }
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                body.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => body.push(c),
+        }
+    }
+
+    format!("{quote}{body}{quote}")
 }
 
 /// Flattens the searchable frontmatter fields into one lowercase string.
@@ -573,12 +651,18 @@ pub fn resolve_page(pages_root: &Path, name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn write_temp(name: &str, contents: &str) -> PathBuf {
-        // Each fixture gets its own directory so `page.name` is the bare file
-        // name rather than a temp-dir-prefixed one.
+        // Tests run concurrently in one process, so the fixture directory is
+        // unique per call rather than per file name. Keying on the name alone
+        // made two tests that both wanted `bad.md` truncate each other's file
+        // mid-read, which failed about a run in four.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+
         let mut path = std::env::temp_dir();
-        path.push(format!("wi-page-{}-{name}", std::process::id()));
+        path.push(format!("wi-page-{}-{unique}-{name}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create temp page dir");
         let file = path.join(name);
         std::fs::write(&file, contents).expect("write temp page");
@@ -655,7 +739,107 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// The same key at two different depths is two different keys.
+    /// Repeats inside a flow collection and inside a list item's own mapping
+    /// are resolved by the parser's own mapping visitor, so no text-level
+    /// heuristic has to know about them.
+    #[test]
+    fn a_duplicate_key_inside_a_flow_collection_keeps_the_page() {
+        let path = write_temp("flowdup.md", "---\na: {x: 1, x: 2}\n---\nbody");
+        let page = parse_page_file(&path).expect("page survives a repeated flow key");
+        assert_eq!(page.meta.get("a"), Some(&json!({"x": 2})));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_duplicate_key_inside_a_list_item_keeps_the_page() {
+        let path = write_temp(
+            "itemdup.md",
+            "---\nitems:\n  - name: a\n    name: b\n---\nbody",
+        );
+        let page = parse_page_file(&path).expect("page survives a repeated list-item key");
+        assert_eq!(page.meta.get("items"), Some(&json!([{"name": "b"}])));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The repeat spans several lines, so no line-oriented rule can decide
+    /// which `a` wins without tracking the brackets.
+    #[test]
+    fn a_duplicate_key_after_a_multiline_flow_value_keeps_the_page() {
+        let path = write_temp("multiflow.md", "---\na: [1,\n  2,\n  1]\na: [9]\n---\nbody");
+        let page = parse_page_file(&path).expect("page survives a repeated flow block");
+        assert_eq!(page.meta.get("a"), Some(&json!([9])));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A repeat must not take unrelated keys with it. Dropping the wrong range
+    /// of lines produces metadata the reference would never produce, silently.
+    #[test]
+    fn deduplication_does_not_disturb_neighbouring_keys() {
+        let path = write_temp(
+            "neighbour.md",
+            "---\ns: 1\na: {p: 1,\n  q: 2}\na: 2\nm: 3\n---\nbody",
+        );
+        let page = parse_page_file(&path).expect("page parses");
+        assert_eq!(page.meta.get("s"), Some(&json!(1)));
+        assert_eq!(page.meta.get("a"), Some(&json!(2)));
+        assert_eq!(page.meta.get("m"), Some(&json!(3)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn deeply_nested_frontmatter_stays_fast() {
+        // A line-oriented deduplication pass was cubic in nesting depth here,
+        // and ran on the blocking pool while holding the cache lock.
+        let path = write_temp("deep.md", &format!("---\n{}---\nbody", nested_block(100)));
+        let started = std::time::Instant::now();
+        let page = parse_page_file(&path).expect("page parses");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "parse was slow"
+        );
+        assert!(!page.meta.is_empty());
+        // The repeat is at the bottom of the chain, and last-wins has to hold
+        // all the way down, not just at the top level.
+        let mut current = page.meta.get("k0").unwrap();
+        for level in 1..100 {
+            current = current.get(format!("k{level}")).unwrap();
+        }
+        assert_eq!(current, &json!({"leaf": 2}));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Beyond the YAML parser's own nesting limit a page is skipped with a
+    /// warning, like any other unparseable frontmatter. What matters is that
+    /// it is skipped promptly rather than grinding.
+    #[test]
+    fn frontmatter_past_the_nesting_limit_is_skipped_promptly() {
+        let path = write_temp(
+            "toodeep.md",
+            &format!("---\n{}---\nbody", nested_block(2000)),
+        );
+        let started = std::time::Instant::now();
+        assert!(parse_page_file(&path).is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "skipping a too-deep page should be immediate"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `depth` levels of nested mapping with a repeated key at the bottom.
+    fn nested_block(depth: usize) -> String {
+        let mut block = String::new();
+        for level in 0..depth {
+            block.push_str(&"  ".repeat(level));
+            block.push_str(&format!("k{level}:\n"));
+        }
+        block.push_str(&"  ".repeat(depth));
+        block.push_str("leaf: 1\n");
+        block.push_str(&"  ".repeat(depth));
+        block.push_str("leaf: 2\n");
+        block
+    }
+
     #[test]
     fn keys_at_different_depths_are_not_repeats() {
         let path = write_temp(
@@ -695,9 +879,73 @@ mod tests {
     fn frontmatter_that_is_only_invalid_still_skips_the_page() {
         let path = write_temp("bad.md", "---\ntitle: [unclosed\n---\nbody");
         assert!(parse_page_file(&path).is_none());
-        // Invalid *and* repeated: the retry must not rescue it either.
-        let path = write_temp("bad2.md", "---\na: 1\na: 2\nb: [x\n---\nbody");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `-$` anchors at end of line, so a trailing space leaves the line as
+    /// invalid YAML, which is what the reference does too.
+    #[test]
+    fn a_bare_dash_with_a_trailing_space_is_not_rescued() {
+        let path = write_temp("dashpad.md", "---\nbranch: - \n---\nbody");
         assert!(parse_page_file(&path).is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_bare_dash_under_a_unicode_key_is_rescued() {
+        let path = write_temp("dashkey.md", "---\ncaf\u{e9}: -\n---\nbody");
+        let page = parse_page_file(&path).expect("page parses");
+        assert_eq!(page.meta.get("caf\u{e9}"), Some(&json!("-")));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn values_render_the_way_python_renders_them() {
+        let path = write_temp(
+            "render.md",
+            "---\ntags:\n  owner: alice\n  path: 'C:\\tmp'\ntype: [a, b]\nother: {k: 1}\n---\nbody",
+        );
+        let page = parse_page_file(&path).expect("page parses");
+
+        // A container applies repr to what it holds, so quoting matters here:
+        // these strings are also the metadata search zone, and the quotes and
+        // backslashes change the tokens that get indexed.
+        assert_eq!(
+            scalar_to_string(page.meta.get("tags").unwrap()),
+            "{'owner': 'alice', 'path': 'C:\\\\tmp'}"
+        );
+        assert_eq!(
+            scalar_to_string(page.meta.get("type").unwrap()),
+            "['a', 'b']"
+        );
+        assert_eq!(
+            scalar_to_string(page.meta.get("other").unwrap()),
+            "{'k': 1}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn non_finite_numbers_stay_visible() {
+        // JSON cannot hold infinity or NaN, and both are truthy in Python, so
+        // they are carried as the strings Python would print rather than
+        // dropped.
+        let path = write_temp("inf.md", "---\nscore: .inf\nother: .nan\n---\nbody");
+        let page = parse_page_file(&path).expect("page parses");
+        assert_eq!(page.meta.get("score"), Some(&json!("inf")));
+        assert_eq!(page.meta.get("other"), Some(&json!("nan")));
+        assert!(is_truthy(page.meta.get("score").unwrap()));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn large_integers_keep_their_exact_value() {
+        let path = write_temp("bigint.md", "---\nid: 12345678901234567890\n---\nbody");
+        let page = parse_page_file(&path).expect("page parses");
+        assert_eq!(
+            scalar_to_string(page.meta.get("id").unwrap()),
+            "12345678901234567890"
+        );
         let _ = std::fs::remove_file(path);
     }
 

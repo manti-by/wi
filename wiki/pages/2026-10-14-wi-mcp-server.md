@@ -53,11 +53,15 @@ by tests that pin behaviour the code is not obviously right about:
   missing query rather than a mistyped one, and a truthy non-string `name` fails
   generically because the reference raised inside path resolution;
 - a repeated frontmatter key keeps its last value instead of invalidating the
-  page, which a strict YAML parser would do. Handling that in Rust took three
-  attempts: matching on the parser's error text missed nested repeats because
-  the message is prefixed with the key path, and dropping only the repeated key
-  line orphaned an indented value and produced invalid YAML in turn. It needs to
-  drop the whole entry, scoped by the enclosing mapping;
+  page, which a strict YAML parser would do. This took three attempts, and the
+  failed ones are the interesting part. Matching on the parser's error text
+  missed nested repeats, because the message is prefixed with the key path.
+  Rewriting the block textually then orphaned an indented value when only the
+  key line was dropped, deleted lines that belonged to unrelated keys when a
+  multi-line flow value threw the scope off, and was cubic in nesting depth —
+  450 seconds on a page nested 3200 levels deep, while holding the cache lock
+  on the blocking pool. The fix was to stop repairing the text at all: mapping
+  construction happens in the deserializer's visitor, which simply overwrites.
 - the frontmatter delimiter is read as a regex, not as "a line containing
   exactly `---`", and `\s*` backtracks rather than taking the whole whitespace
   run. Greedy-only gets `---\n---\nbody` right and `---\n\n---\nbody` wrong, and
@@ -74,6 +78,12 @@ as octal; this binary uses a 1.2 parser and reads them as strings. Emulating 1.1
 would mean reimplementing scalar resolution to reproduce a quirk most writers
 consider a bug — and the difference is visible in output only for values that
 should have been quoted anyway.
+
+The general lesson is the one worth carrying: every one of these bugs was
+*silent*. Nothing raised, nothing logged an error, and a page that existed on
+disk simply stopped being findable. The only reason they were caught is that a
+differential harness ran the Rust against the Python on the same inputs — a unit
+test written alongside the bug passes just as happily.
 
 See [wiki search ranking](2026-10-14-wiki-search-ranking.md) for why the ranking
 behaves the way it does, and
