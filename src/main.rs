@@ -21,6 +21,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tracing_subscriber::EnvFilter;
 
+use crate::corpus::CorpusCache;
 use crate::error::ServeError;
 use crate::tools::WikiService;
 
@@ -62,6 +63,14 @@ struct Args {
     /// Directory holding the `*.md` wiki pages.
     #[arg(long, default_value = DEFAULT_WIKI_PATH, value_name = "PATH")]
     wiki_path: PathBuf,
+
+    /// Extra hostname or `host:port` to accept in the `Host` header.
+    ///
+    /// Only needed when `--host` binds somewhere other than loopback, so that
+    /// clients reach the server by the address they were given rather than by
+    /// spoofing `Host: localhost`. Repeatable.
+    #[arg(long = "allowed-host", value_name = "HOST")]
+    allowed_hosts: Vec<String>,
 }
 
 #[tokio::main]
@@ -77,7 +86,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    serve(wiki_host(&args.host)?, args.port, root).await
+    let address = wiki_host(&args.host)?;
+    if !address.is_loopback() {
+        // Nothing here authenticates a client, so an exposed bind is an
+        // explicit decision that deserves to be noisy rather than silent.
+        tracing::warn!(
+            host = %args.host,
+            "serving on a non-loopback interface with no authentication; \
+             add --allowed-host for each name clients use to reach this address"
+        );
+    }
+
+    serve(address, args.port, root, &args.host, &args.allowed_hosts).await
 }
 
 /// Resolves the pages root to an absolute path.
@@ -126,7 +146,13 @@ fn wiki_host(host: &str) -> anyhow::Result<IpAddr> {
 }
 
 /// Starts the HTTP server and serves until it is shut down.
-async fn serve(address: IpAddr, port: u16, root: PathBuf) -> anyhow::Result<()> {
+async fn serve(
+    address: IpAddr,
+    port: u16,
+    root: PathBuf,
+    requested_host: &str,
+    extra_hosts: &[String],
+) -> anyhow::Result<()> {
     let address = SocketAddr::new(address, port);
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -139,14 +165,22 @@ async fn serve(address: IpAddr, port: u16, root: PathBuf) -> anyhow::Result<()> 
     let bound = listener.local_addr()?;
     tracing::info!(%bound, wiki_path = %root.display(), "wi listening");
 
-    // The factory is called once per MCP session. Each handler owns a handle on
-    // the same directory, and the corpus cache is rebuilt per handler, which
-    // costs one directory scan per session rather than per query.
+    // One cache behind every session handler, so N clients cost one parse of
+    // the wiki rather than N.
+    let cache = Arc::new(CorpusCache::new());
+
     let factory_root = root.clone();
+    let factory_cache = Arc::clone(&cache);
     let service = StreamableHttpService::new(
-        move || Ok(WikiService::new(factory_root.clone())),
+        move || {
+            Ok(WikiService::with_cache(
+                factory_root.clone(),
+                Arc::clone(&factory_cache),
+            ))
+        },
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        StreamableHttpServerConfig::default()
+            .with_allowed_hosts(allowed_hosts(requested_host, extra_hosts)),
     );
 
     // MCP clients post to `/mcp`, but the transport owns its own routing and
@@ -161,6 +195,33 @@ async fn serve(address: IpAddr, port: u16, root: PathBuf) -> anyhow::Result<()> 
 
     tracing::info!("wi stopped");
     Ok(())
+}
+
+/// Builds the transport's `Host` allowlist.
+///
+/// The transport rejects requests whose `Host` header is not on this list, which
+/// is what stops a browser on another site from reaching a loopback server
+/// through DNS rebinding. Deriving the list from `--host` matters: the default
+/// list is loopback-only, so binding elsewhere without widening it would leave
+/// the server simultaneously reachable by a spoofed `Host: localhost` from the
+/// network *and* unreachable by the address the operator actually asked for.
+fn allowed_hosts(host: &str, extra: &[String]) -> Vec<String> {
+    let mut hosts = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    // A specific interface sends its own name; a wildcard binds every one, and
+    // `0.0.0.0` is never a Host header a client would legitimately send.
+    if !matches!(host, "0.0.0.0" | "::" | "[::]") && !hosts.iter().any(|h| h == host) {
+        hosts.push(host.to_string());
+    }
+    for allowed in extra {
+        if !hosts.contains(allowed) {
+            hosts.push(allowed.clone());
+        }
+    }
+    hosts
 }
 
 /// Resolves when the process is asked to stop.
@@ -200,4 +261,48 @@ fn init_tracing() -> Result<(), ServeError> {
         .with_writer(std::io::stderr)
         .try_init()
         .map_err(ServeError::Logging)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_is_always_allowed() {
+        let hosts = allowed_hosts("127.0.0.1", &[]);
+        assert!(hosts.contains(&"localhost".to_string()));
+        assert!(hosts.contains(&"127.0.0.1".to_string()));
+        assert!(hosts.contains(&"::1".to_string()));
+    }
+
+    #[test]
+    fn a_specific_interface_adds_its_own_name() {
+        let hosts = allowed_hosts("192.168.1.5", &[]);
+        assert!(hosts.contains(&"192.168.1.5".to_string()));
+    }
+
+    /// A wildcard is not a name any client would send, and it must not widen
+    /// the loopback list on its own.
+    #[test]
+    fn a_wildcard_bind_does_not_add_itself() {
+        for wildcard in ["0.0.0.0", "::"] {
+            let hosts = allowed_hosts(wildcard, &[]);
+            assert!(!hosts.contains(&wildcard.to_string()));
+            assert_eq!(hosts.len(), 3);
+        }
+    }
+
+    #[test]
+    fn extra_allowed_hosts_are_added_without_duplicates() {
+        let hosts = allowed_hosts("0.0.0.0", &["wiki.internal".into(), "wiki.internal".into()]);
+        assert_eq!(hosts.iter().filter(|h| *h == "wiki.internal").count(), 1);
+    }
+
+    #[test]
+    fn hostnames_and_addresses_both_resolve() {
+        assert!(wiki_host("127.0.0.1").is_ok());
+        assert!(wiki_host("0.0.0.0").is_ok());
+        assert_eq!(wiki_host("192.0.2.7").unwrap().to_string(), "192.0.2.7");
+        assert!(wiki_host("no-such-host.invalid").is_err());
+    }
 }

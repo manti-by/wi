@@ -8,7 +8,7 @@
 //! the directory.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::page::{Page, WIKI_FIELDS, parse_page_file};
 use crate::search::{CorpusStats, FieldCounts, build_stats, score_document};
@@ -44,9 +44,12 @@ pub struct Ranked {
 }
 
 /// Single-slot cache that rebuilds a corpus only when its files change.
+///
+/// Shared across every MCP session, so N clients cost one parse of the wiki
+/// rather than N.
 #[derive(Debug, Default)]
 pub struct CorpusCache {
-    cached: Mutex<Option<Arc<Corpus>>>,
+    cached: tokio::sync::Mutex<Option<Arc<Corpus>>>,
 }
 
 impl CorpusCache {
@@ -57,13 +60,15 @@ impl CorpusCache {
 
     /// Returns the current snapshot for a directory, rebuilding it if stale.
     ///
-    /// The lock is held across the rebuild so two concurrent searches cannot
-    /// both parse the directory; everything inside it is in-memory plus a few
-    /// small local reads.
-    pub fn get(&self, root: &Path) -> Arc<Corpus> {
-        let mut cached = self.cached.lock().expect("corpus cache poisoned");
-        let fingerprint = fingerprint_pages(root);
+    /// Both the fingerprint and the rebuild run on the blocking pool: reading
+    /// and YAML-parsing every page on a runtime worker would stall the server
+    /// for the duration, including the SSE keepalives of live sessions. The
+    /// lock is held across the rebuild so concurrent cold searches cannot both
+    /// parse the directory.
+    pub async fn get(&self, root: PathBuf) -> Arc<Corpus> {
+        let fingerprint = fingerprint_pages(&root);
 
+        let mut cached = self.cached.lock().await;
         if let Some(corpus) = cached.as_ref()
             && corpus.root == root
             && corpus.fingerprint == fingerprint
@@ -71,7 +76,26 @@ impl CorpusCache {
             return Arc::clone(corpus);
         }
 
-        Arc::clone(cached.insert(build_corpus(root, fingerprint)))
+        let built = tokio::task::spawn_blocking({
+            let root = root.clone();
+            let fingerprint = fingerprint.clone();
+            move || build_corpus(&root, fingerprint)
+        })
+        .await;
+
+        // A panicking parse must not take every later tool call with it: the
+        // wiki is a directory of text files, and serving a stale snapshot is a
+        // far better failure than refusing to answer at all.
+        match built {
+            Ok(corpus) => Arc::clone(cached.insert(corpus)),
+            Err(error) => {
+                tracing::error!(%error, "corpus rebuild panicked");
+                match cached.as_ref() {
+                    Some(previous) => Arc::clone(previous),
+                    None => build_corpus(&root, Vec::new()),
+                }
+            }
+        }
     }
 }
 
@@ -192,7 +216,7 @@ mod tests {
         let root = make_root("order");
         write(&root, "b.md", "---\ntitle: Beta\n---\nbody b");
         write(&root, "a.md", "---\ntitle: Alpha\n---\nbody a");
-        let corpus = CorpusCache::new().get(&root);
+        let corpus = block_on(CorpusCache::new().get(root.clone()));
         let names: Vec<&str> = corpus.items.iter().map(|page| page.name.as_str()).collect();
         assert_eq!(names, vec!["a.md", "b.md"]);
         let _ = std::fs::remove_dir_all(root);
@@ -201,7 +225,7 @@ mod tests {
     #[test]
     fn a_missing_directory_yields_an_empty_corpus() {
         let root = make_root("missing").join("absent");
-        let corpus = CorpusCache::new().get(&root);
+        let corpus = block_on(CorpusCache::new().get(root));
         assert_eq!(corpus.stats.document_count, 0);
         assert!(corpus.items.is_empty());
     }
@@ -211,7 +235,7 @@ mod tests {
         let root = make_root("agree");
         write(&root, "relay.md", "---\ntitle: Relay\n---\nthe relay mode");
         write(&root, "pump.md", "---\ntitle: Pump\n---\na pump page");
-        let corpus = CorpusCache::new().get(&root);
+        let corpus = block_on(CorpusCache::new().get(root.clone()));
         assert_eq!(corpus.items.len(), corpus.documents.len());
         assert_eq!(corpus.items.len(), corpus.stats.document_count);
         let _ = std::fs::remove_dir_all(root);
@@ -223,7 +247,7 @@ mod tests {
         write(&root, "relay.md", "---\ntitle: Relay\n---\nthe relay mode");
         write(&root, "pump.md", "---\ntitle: Pump\n---\na pump page");
         let cache = CorpusCache::new();
-        let corpus = cache.get(&root);
+        let corpus = block_on(cache.get(root.clone()));
         let hits = rank(&corpus, &["relay".to_string()]);
         assert_eq!(hits.len(), 1);
         assert_eq!(corpus.items[hits[0].index].name, "relay.md");
@@ -232,13 +256,33 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_directory_reuses_the_same_snapshot() {
+        let root = make_root("identity");
+        write(&root, "relay.md", "---\ntitle: Relay\n---\nrelay");
+        let cache = CorpusCache::new();
+        let first = block_on(cache.get(root.clone()));
+        let second = block_on(cache.get(root.clone()));
+        assert!(Arc::ptr_eq(&first, &second));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_new_page_invalidates_the_cached_corpus() {
         let root = make_root("invalidate");
         write(&root, "relay.md", "---\ntitle: Relay\n---\nrelay");
         let cache = CorpusCache::new();
-        assert_eq!(cache.get(&root).items.len(), 1);
+        assert_eq!(block_on(cache.get(root.clone())).items.len(), 1);
         write(&root, "pump.md", "---\ntitle: Pump\n---\npump");
-        assert_eq!(cache.get(&root).items.len(), 2);
+        assert_eq!(block_on(cache.get(root.clone())).items.len(), 2);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Runs a future to completion on a fresh multi-threaded runtime.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime")
+            .block_on(future)
     }
 }

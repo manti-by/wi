@@ -40,15 +40,29 @@ OPTIONS:
         --host <HOST>        Interface to bind [default: 127.0.0.1]
         --port <PORT>        Port to bind [default: 4321]
         --wiki-path <PATH>   Directory holding the `*.md` wiki pages [default: wiki/pages]
+        --allowed-host <HOST>  Extra hostname or host:port to accept in the Host header
     -h, --help               Print help
     -V, --version            Print version
 ```
 
 The server binds loopback by default, because it serves a project's private
-notes. Binding another interface is a deliberate choice:
+notes. Nothing here authenticates a client, so exposing it is a deliberate act
+and the server says so in a warning when it does:
 
 ```console
 $ wi --host 0.0.0.0 --port 8080 --wiki-path ~/notes/wiki
+WARN wi: serving on a non-loopback interface with no authentication; add
+         --allowed-host for each name clients use to reach this address
+```
+
+The transport rejects requests whose `Host` header is not on its allowlist,
+which is what stops a web page from reaching a loopback server through DNS
+rebinding. Loopback names are always allowed; a specific `--host` adds itself.
+When binding a wildcard there is no name clients would send, so add the names
+they actually use:
+
+```console
+$ wi --host 0.0.0.0 --allowed-host wiki.internal --allowed-host 192.168.1.5
 ```
 
 `--wiki-path` may be relative, in which case it resolves against the working
@@ -163,11 +177,22 @@ Frontmatter is optional. `title`, `type`, `date` and `status` are for display;
 `tags`, `services`, `areas`, `tickets` and `type` are also searched. A bare `-`
 is read as the literal string rather than as YAML null, so `branch: -` means "no
 branch". A page whose frontmatter is invalid YAML, or is not a mapping, is
-skipped with a warning rather than served half-parsed.
+skipped with a warning rather than served half-parsed. A repeated key keeps its
+last value, the way YAML normally resolves it, rather than invalidating the page.
+Carriage returns are normalized on read, so a page edited on Windows gets the
+same line numbers as one edited on Linux.
 
 `wiki_get_page` resolves a name against the pages root: the `.md` suffix is
 optional, a leading `pages/` is stripped, and anything that resolves outside the
-root is refused.
+root — through `..`, an absolute path, or a symlink — is refused.
+
+### Known divergence from the Python original
+
+The Python implementation resolves frontmatter with PyYAML, which implements
+YAML 1.1; this binary uses a 1.2 parser. A bare `yes`, `no`, `on` or `off` used
+as a whole value therefore reads as the string here and as `True`/`False` there —
+`status: yes` displays `status: yes` instead of `status: True`. Quoting the value
+(`status: "yes"`) makes both agree. Everything else in the page format matches.
 
 ## Development
 

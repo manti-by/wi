@@ -52,49 +52,43 @@ impl CorpusStats {
 
 /// Splits text into lowercase searchable terms.
 ///
-/// Terms are the maximal runs of `[a-z0-9]` followed by `[a-z0-9_.-]*`. Stop
-/// words and tokens shorter than [`MIN_TERM_LENGTH`] are dropped.
+/// A term is a run starting with `[a-z0-9]` and continuing with `[a-z0-9_.-]*`.
+/// The continuation set is deliberately unconditional: `release.` and
+/// `self._private` are single terms, because that is what the reference
+/// analyzer produces and a term may only match a whole token.
+///
+/// Terms that are stop words or shorter than [`MIN_TERM_LENGTH`] are dropped.
 pub fn extract_terms(text: &str) -> Vec<String> {
     let mut terms = Vec::new();
-    let mut current = String::new();
-
-    // Scanning by hand rather than with a regex keeps the token definition
-    // explicit and matches the reference pattern exactly. Folding case up
-    // front is what lets the match be a plain ASCII test.
     let lower = text.to_lowercase();
+    let bytes = lower.as_bytes();
 
-    for (index, ch) in lower.char_indices() {
-        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
-            current.push(ch);
+    let is_head = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let is_continuation = |byte: u8| is_head(byte) || matches!(byte, b'_' | b'.' | b'-');
+
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if !is_head(bytes[cursor]) {
+            cursor += 1;
             continue;
         }
-        // A separator only joins a token when more token characters follow, so
-        // `relay-` ends the token but `relay.mode` keeps going.
-        if !current.is_empty()
-            && matches!(ch, '_' | '.' | '-')
-            && lower[index + ch.len_utf8()..]
-                .chars()
-                .next()
-                .is_some_and(|next| next.is_ascii_lowercase() || next.is_ascii_digit())
-        {
-            current.push(ch);
-            continue;
+        let start = cursor;
+        cursor += 1;
+        while cursor < bytes.len() && is_continuation(bytes[cursor]) {
+            cursor += 1;
         }
-        if !current.is_empty() {
-            push_term(&mut current, &mut terms);
-        }
+        // Every byte inspected is ASCII, and a multi-byte UTF-8 character has no
+        // byte below 0x80, so `start` and `cursor` are always char boundaries.
+        push_term(&lower[start..cursor], &mut terms);
     }
-    push_term(&mut current, &mut terms);
 
     terms
 }
 
 /// Keeps a finished token if it is long enough and is not a stop word.
-fn push_term(current: &mut String, terms: &mut Vec<String>) {
-    if current.len() >= MIN_TERM_LENGTH && !config::is_stop_word(current.as_str()) {
-        terms.push(std::mem::take(current));
-    } else {
-        current.clear();
+fn push_term(term: &str, terms: &mut Vec<String>) {
+    if term.len() >= MIN_TERM_LENGTH && !config::is_stop_word(term) {
+        terms.push(term.to_string());
     }
 }
 
@@ -263,20 +257,38 @@ mod tests {
         );
     }
 
+    // The reference analyzer is the regex `[a-z0-9][a-z0-9_.-]*`: once a term
+    // starts, `_`, `.` and `-` continue it unconditionally. These cases pin
+    // that down, because the intuitive "a trailing dot is punctuation" reading
+    // produces different tokens and therefore different scores.
+    #[test]
+    fn separator_characters_continue_a_token_unconditionally() {
+        assert_eq!(extract_terms("release."), vec!["release."]);
+        assert_eq!(extract_terms("self._private"), vec!["self._private"]);
+        assert_eq!(extract_terms("x..y"), vec!["x..y"]);
+        assert_eq!(extract_terms("a_"), vec!["a_"]);
+        assert_eq!(extract_terms("__init__"), vec!["init__"]);
+    }
+
+    #[test]
+    fn a_separator_ends_a_term_when_the_next_char_cannot_start_one() {
+        assert_eq!(extract_terms("relay, mode."), vec!["relay", "mode."]);
+        assert_eq!(extract_terms("relay- mode"), vec!["relay-", "mode"]);
+    }
+
+    #[test]
+    fn non_ascii_is_a_term_boundary() {
+        assert_eq!(extract_terms("relay → mode"), vec!["relay", "mode"]);
+    }
+
     #[test]
     fn drops_stop_words_and_single_characters() {
         assert_eq!(extract_terms("the of a 1 relay"), vec!["relay"]);
     }
 
     #[test]
-    fn trailing_punctuation_is_not_part_of_a_token() {
-        assert_eq!(extract_terms("relay, mode."), vec!["relay", "mode"]);
-    }
-
-    #[test]
-    fn a_dash_inside_a_token_survives_but_a_trailing_one_does_not() {
-        assert_eq!(extract_terms("mnt-238"), vec!["mnt-238"]);
-        assert_eq!(extract_terms("relay- mode"), vec!["relay", "mode"]);
+    fn a_hyphenated_identifier_is_one_term() {
+        assert_eq!(extract_terms("MNT-238"), vec!["mnt-238"]);
     }
 
     #[test]

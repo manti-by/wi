@@ -51,24 +51,45 @@ impl Page {
 }
 
 /// Returns a frontmatter value rendered as a string, or `None` when it is
-/// absent or empty.
+/// absent or falsy.
+///
+/// Falsy rather than merely empty, because the reference summarizer writes
+/// `meta.get(key) or '-'` and `meta.get("title") or name`: a `title: 0` or
+/// `status: false` falls back exactly the way an absent value does, and the
+/// title in particular feeds the highest-weighted search zone.
 fn meta_string(meta: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     match meta.get(key) {
-        None | Some(serde_json::Value::Null) => None,
-        Some(value) => {
-            let text = scalar_to_string(value);
-            if text.is_empty() { None } else { Some(text) }
-        }
+        Some(value) if is_truthy(value) => Some(scalar_to_string(value)),
+        _ => None,
     }
 }
 
-/// Renders a scalar the way Python's `str()` would, so summaries read the same.
+/// Renders a value the way Python's `str()` would.
+///
+/// Frontmatter reaches the agent's output through this function, so `None` has
+/// to render as `None` rather than `null`, and a list or mapping sitting under
+/// a scalar key has to render in Python's repr style.
 fn scalar_to_string(value: &serde_json::Value) -> String {
     match value {
-        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => "None".to_string(),
         serde_json::Value::Bool(flag) => if *flag { "True" } else { "False" }.to_string(),
         serde_json::Value::Number(number) => number.to_string(),
-        other => other.to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(scalar_to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        serde_json::Value::Object(map) => format!(
+            "{{{}}}",
+            map.iter()
+                .map(|(key, value)| format!("{key:?}: {}", scalar_to_string(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -90,7 +111,7 @@ fn is_truthy(value: &serde_json::Value) -> bool {
 /// or is not a mapping; such pages are invisible to every tool rather than
 /// surfacing as half-parsed entries.
 pub fn parse_page_file(path: &Path) -> Option<Page> {
-    let text = match std::fs::read_to_string(path) {
+    let raw = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) => {
             tracing::warn!(page = %path.display(), %error, "skipping unreadable page");
@@ -100,7 +121,12 @@ pub fn parse_page_file(path: &Path) -> Option<Page> {
 
     let name = path.file_name()?.to_string_lossy().into_owned();
 
-    let Some((meta, body_offset)) = split_frontmatter(&text) else {
+    // Pages are hand-edited and travel between machines, so CRLF has to be
+    // normalized on the way in: it would otherwise shift every body offset,
+    // every snippet's line number and the text `wiki_get_page` returns.
+    let text = normalize_newlines(&raw);
+
+    let Some((block, body_offset)) = split_frontmatter(&text) else {
         return Some(Page {
             name,
             meta: serde_json::Map::new(),
@@ -108,9 +134,9 @@ pub fn parse_page_file(path: &Path) -> Option<Page> {
         });
     };
 
-    let block = rescue_bare_dashes(meta);
-    let parsed: Value = match serde_yaml::from_str(&block) {
-        Ok(value) => value,
+    let block = rescue_bare_dashes(block);
+    let parsed = match parse_yaml_block(&block) {
+        Ok(parsed) => parsed,
         Err(error) => {
             tracing::warn!(page = %name, %error, "skipping page with invalid frontmatter");
             return None;
@@ -133,37 +159,138 @@ pub fn parse_page_file(path: &Path) -> Option<Page> {
     })
 }
 
+/// Rewrites CRLF and lone CR to LF.
+fn normalize_newlines(text: &str) -> String {
+    if !text.contains('\r') {
+        return text.to_string();
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// Splits leading frontmatter from the body.
 ///
-/// Mirrors `\A---\s*\n(.*?)\n---\s*\n?`: a file that does not open with a `---`
-/// line has no frontmatter at all, and a file that opens one but never closes
-/// it is left whole rather than being silently swallowed.
+/// Mirrors `\A---\s*\n(.*?)\n---\s*\n?` exactly, which has three consequences
+/// that are easy to get wrong:
+///
+/// - the opening `---` is followed by whitespace *including* newlines, so a
+///   blank line after it is part of the delimiter rather than the block;
+/// - the closing `---` must be preceded by a newline, so `---\n---\nbody` is
+///   **not** frontmatter — the first `---` cannot also close the block;
+/// - the closing `---` is not required to end its line, so `---foo` closes it
+///   and leaves `foo` at the start of the body.
 fn split_frontmatter(text: &str) -> Option<(&str, usize)> {
     let after_open = text.strip_prefix("---")?;
-    // `\s*` tolerates trailing spaces before the opening delimiter's newline.
-    let rest = after_open.trim_start_matches([' ', '\t', '\r']);
-    let rest = rest.strip_prefix('\n')?;
+
+    // `\s*` after the opening delimiter spans newlines too. Backtracking leaves
+    // the block starting right after the *last* newline of that run, and there
+    // has to be at least one newline for the delimiter to exist at all.
+    let trimmed = after_open.trim_start_matches([' ', '\t', '\r', '\n']);
+    let consumed = &after_open[..after_open.len() - trimmed.len()];
+    consumed.rfind('\n')?;
+
+    let rest = trimmed;
     let rest_offset = text.len() - rest.len();
 
-    // Find the closing delimiter. It must be the whole of its own line, and
-    // the lazy `.*?` in the original pattern cannot reach past end-of-input,
-    // so an unterminated block means the page simply has no frontmatter.
     let mut cursor = 0;
-    let (block_end, line_end) = loop {
-        let end = cursor + rest[cursor..].find('\n')?;
-        if rest[cursor..end].trim() == "---" {
-            break (cursor, end);
+    // The block's first line can never be the closing delimiter: `\n---` needs
+    // a newline that belongs to the already-consumed opening delimiter, so
+    // `---\n---\nbody` is a page with no frontmatter at all.
+    let mut is_first_line = true;
+    let closing = loop {
+        let (line, advance) = match rest[cursor..].find('\n') {
+            Some(offset) => (&rest[cursor..cursor + offset], offset + 1),
+            None => (&rest[cursor..], rest.len() - cursor),
+        };
+        if !is_first_line && line.starts_with("---") {
+            break cursor;
         }
-        cursor = end + 1;
+        is_first_line = false;
+        if advance == 0 {
+            return None;
+        }
+        cursor += advance;
+        if cursor >= rest.len() {
+            return None;
+        }
     };
 
-    // `\s*\n?` after the closing delimiter eats the newline and any blank
-    // lines that follow, so the body starts at the first real content.
-    let after = &rest[line_end + 1..];
+    // The closing `---`, then `\s*`, which eats the rest of the fence line and
+    // any blank lines after it.
+    let after = &rest[closing + 3..];
     let body = after.trim_start_matches([' ', '\t', '\r', '\n']);
-    let body_offset = rest_offset + line_end + 1 + (after.len() - body.len());
+    Some((
+        &rest[..closing],
+        rest_offset + closing + 3 + (after.len() - body.len()),
+    ))
+}
 
-    Some((&rest[..block_end], body_offset))
+/// Parses a frontmatter block, rejecting duplicate keys the way YAML strictly
+/// does — but keeping the last value instead of discarding the page.
+///
+/// The reference loader resolves duplicates last-wins, so a page that happens to
+/// repeat a key stays visible. A stricter parser would drop it from every tool
+/// at once, which is a silent loss of a page that exists on disk.
+fn parse_yaml_block(block: &str) -> Result<Value, serde_yaml::Error> {
+    match serde_yaml::from_str::<Value>(block) {
+        Err(error) if error.to_string().starts_with("duplicate entry with key") => {
+            match serde_yaml::from_str::<Value>(&dedupe_keys(block)) {
+                Ok(value) => Ok(value),
+                // A duplicate buried in a nested block is not worth a bespoke
+                // YAML editor; fall back to reporting the original failure.
+                Err(_) => Err(error),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Returns the key of a top-level `key: value` line, or `None` for a line that
+/// belongs to a nested block or a list item.
+fn top_level_key(line: &str) -> Option<&str> {
+    if line.starts_with(char::is_whitespace) || line.trim_start().starts_with('-') {
+        return None;
+    }
+    let colon = line.find(':')?;
+    let key = line[..colon].trim_end();
+    (!key.is_empty() && !key.starts_with(char::is_whitespace)).then_some(key)
+}
+
+/// Removes earlier repeats of a top-level key, leaving the last occurrence.
+///
+/// Operates on the raw block because a duplicate-key error carries no position
+/// information, and a top-level repeat is the shape a hand-written frontmatter
+/// actually has. Lines that are indented or start a list item belong to a
+/// nested structure and are left untouched.
+fn dedupe_keys(block: &str) -> String {
+    let lines: Vec<&str> = block.split('\n').collect();
+
+    let key_at = top_level_key;
+
+    // First pass: where each top-level key last appears.
+    let mut last_index_of: Vec<(&str, usize)> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(key) = key_at(line) {
+            match last_index_of.iter_mut().find(|(name, _)| *name == key) {
+                Some(slot) => slot.1 = index,
+                None => last_index_of.push((key, index)),
+            }
+        }
+    }
+
+    // Second pass: drop every earlier line that carries a repeated key.
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        let repeated = key_at(line).is_some_and(|key| {
+            last_index_of
+                .iter()
+                .any(|(name, last)| *name == key && *last != index)
+        });
+        if !repeated {
+            kept.push(line);
+        }
+    }
+
+    kept.join("\n")
 }
 
 /// Quotes bare `-` values in a frontmatter block.
@@ -387,6 +514,76 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_key_keeps_the_last_value_and_the_page() {
+        let path = write_temp(
+            "dup.md",
+            "---\ntitle: First\ntitle: Second\ntags: [relay]\n---\nbody",
+        );
+        let page = parse_page_file(&path).expect("a repeated key must not make the page disappear");
+        assert_eq!(page.meta.get("title"), Some(&json!("Second")));
+        assert_eq!(page.meta.get("tags"), Some(&json!(["relay"])));
+        assert_eq!(page.body, "body");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The reference delimiter is `\A---\s*\n(.*?)\n---\s*\n?`, and each of
+    /// these is a place where reading it as "a line containing exactly ---"
+    /// gives a different answer.
+    #[test]
+    fn the_opening_delimiter_does_not_also_close_the_block() {
+        let path = write_temp("emptyfm.md", "---\n---\nrelay in body\n");
+        let page = parse_page_file(&path).expect("page parses");
+        assert!(page.meta.is_empty());
+        // No frontmatter at all, so the whole file is the body.
+        assert_eq!(page.body, "---\n---\nrelay in body\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_closing_delimiter_need_not_end_its_line() {
+        let path = write_temp("closetail.md", "---\ntitle: x\n---foo\nbody\n");
+        let page = parse_page_file(&path).expect("page parses");
+        assert_eq!(page.meta.get("title"), Some(&json!("x")));
+        assert_eq!(page.body, "foo\nbody\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_indented_fence_does_not_close_the_block() {
+        let path = write_temp("indent.md", "---\ntitle: x\n  ---\nbody\n");
+        let page = parse_page_file(&path).expect("page parses");
+        assert!(page.meta.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_block_may_close_at_end_of_file() {
+        let path = write_temp("eof.md", "---\ntitle: X\n---");
+        let page = parse_page_file(&path).expect("page parses");
+        assert_eq!(page.meta.get("title"), Some(&json!("X")));
+        assert_eq!(page.body, "");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn crlf_pages_are_normalized() {
+        let path = write_temp(
+            "crlf.md",
+            "---\r\ntitle: X\r\n---\r\nrelay line\r\nsecond\r\n",
+        );
+        let page = parse_page_file(&path).expect("page parses");
+        assert_eq!(page.meta.get("title"), Some(&json!("X")));
+        // Body line numbers, and the text wiki_get_page returns, both depend on
+        // this being LF-only.
+        assert_eq!(page.body, "relay line\nsecond\n");
+        assert_eq!(
+            extract_snippets(&page.body, &["relay".into()]),
+            ["L1: relay line"]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn invalid_frontmatter_skips_the_page() {
         let path = write_temp("bad.md", "---\ntitle: [unclosed\n---\nbody");
         assert!(parse_page_file(&path).is_none());
@@ -397,6 +594,31 @@ mod tests {
     fn non_mapping_frontmatter_skips_the_page() {
         let path = write_temp("scalar.md", "---\n- one\n- two\n---\nbody");
         assert!(parse_page_file(&path).is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn null_list_entries_render_as_none() {
+        // `str(None)` is "None", and it becomes an indexed term too, so getting
+        // this wrong changes scores rather than just display.
+        let path = write_temp("nulllist.md", "---\ntickets:\n  - MNT-1\n  -\n---\nbody");
+        let page = parse_page_file(&path).expect("page parses");
+        assert_eq!(
+            summarize_meta(&page.meta),
+            "type: -, date: -, status: -, tickets: MNT-1, None"
+        );
+        assert!(metadata_text(&page.meta).contains("mnt-1 none"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn falsy_scalars_fall_back_the_way_they_do_in_the_reference() {
+        // `meta.get(key) or '-'` is falsiness-based, and the title decides both
+        // the display and the highest-weighted search zone.
+        let path = write_temp("zero.md", "---\ntitle: 0\nstatus: false\n---\nbody");
+        let page = parse_page_file(&path).expect("page parses");
+        assert_eq!(page_title(&page), "zero.md");
+        assert_eq!(summarize_meta(&page.meta), "type: -, date: -, status: -");
         let _ = std::fs::remove_file(path);
     }
 

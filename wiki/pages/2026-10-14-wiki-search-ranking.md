@@ -72,6 +72,18 @@ dots, underscores and hyphens inside a token, because wiki pages are full of API
 names (`relay.get_target_state`) and ticket IDs (`MNT-238`) that would otherwise
 shatter into meaningless fragments.
 
+The continuation set is *unconditional*: once a term starts, `_`, `.` and `-`
+keep extending it whatever follows. So `release.` is one term, `self._private` is
+one term, and `a_` is one term. This reads as wrong — a trailing dot looks like
+punctuation — and the first implementation got it wrong by requiring a following
+alphanumeric. The fix changed which pages a search matched, not just how they
+scored, because the corpus-wide field lengths feed the length-normalization
+divisor for every query.
+
+That is the general hazard in porting a ranker: the analyzer is not a detail of
+tokenization, it is an input to the corpus statistics. A divergence that looks
+cosmetic in one function propagates into every score.
+
 ## Why results are deterministic
 
 Equal scores break by file name ascending. File names are `YYYY-MM-DD-slug.md`,
@@ -89,6 +101,16 @@ The important property is that items, counts and statistics are published in a
 single assignment from a fully built value. A caller can never observe a corpus
 whose items come from one generation of the directory and whose statistics come
 from another — which would silently produce wrong scores rather than an error.
+
+The rebuild runs on the blocking pool and the fingerprint and the rebuild share
+one lock, so concurrent cold searches cannot both parse the wiki. The first
+implementation held a `std::sync::Mutex` across blocking file I/O on a runtime
+worker, which stalled the executor — including the SSE keepalives of live
+sessions — for the duration of a cold parse.
+
+The cache is shared across MCP sessions rather than built per handler. The
+transport constructs one handler per connection, so a per-handler cache meant N
+clients caused N full parses and N copies of the corpus in memory.
 
 ## Known limits
 

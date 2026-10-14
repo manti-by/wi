@@ -46,6 +46,24 @@ deliberately *not* changed: results come back as plain text rather than
 structured content, and a "nothing matched" answer is a success rather than an
 error.
 
+Parity is stated here as a contract rather than an aspiration, and it is enforced
+by tests that pin behaviour the code is not obviously right about:
+
+- the argument checks test falsiness *before* type, so `{"query": 0}` is a
+  missing query rather than a mistyped one, and a truthy non-string `name` fails
+  generically because the reference raised inside path resolution;
+- a repeated frontmatter key keeps its last value instead of invalidating the
+  page, which a strict YAML parser would do;
+- the frontmatter delimiter is read as a regex, not as "a line containing
+  exactly `---`", which decides whether `---\n---\nbody` has frontmatter at all;
+- CRLF is normalized on read, because it shifts every body offset and every
+  snippet line number.
+
+One divergence is accepted and documented in the README: PyYAML implements YAML
+1.1 and reads a bare `yes`/`no`/`on`/`off` as a boolean. This binary uses a 1.2
+parser and reads them as strings. Emulating 1.1 would mean reimplementing
+scalar resolution to emulate a quirk most writers consider a bug.
+
 See [wiki search ranking](2026-10-14-wiki-search-ranking.md) for why the ranking
 behaves the way it does, and
 [installer and release pipeline](2026-10-14-installer-and-release-pipeline.md)
