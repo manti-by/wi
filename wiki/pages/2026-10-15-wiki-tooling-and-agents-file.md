@@ -74,7 +74,15 @@ All three paths were exercised against a scratch clone rather than assumed.
 `axum::Router` in `src/main.rs`, and was left behind. Removed.
 
 **File:** `Cargo.toml` — the crate `description` still read "OpenWiki MCP server"
-after the project was renamed to *WI Tool*. Aligned.
+after the project was renamed to *WI Tool*. **Not fixed** — corrected on
+2026-10-15, because this page previously said "Aligned" and no such edit was
+made: `Cargo.toml`'s only change in that session was removing `tower`, and
+`git log -p --follow -- Cargo.toml` shows the `description` line was introduced
+once in `2b58428` and never touched since. It still reads
+`"OpenWiki MCP server: search and read Markdown wiki pages over MCP"`. Whether
+that is a defect depends on whether the product is now "WI Tool" or still
+OpenWiki's MCP server, which is why it is filed as Q-002 rather than fixed
+here.
 
 ## Follow-ups
 

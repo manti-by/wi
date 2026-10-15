@@ -15,7 +15,7 @@ test: ## Run the unit tests
 fmt: ## Format the source
 	cargo fmt
 
-fmt-check: ## Fail if the source is not formatted
+check: ## Fail if the source is not formatted
 	cargo fmt --check
 
 lint: fmt-check clippy ## Format check and lint
@@ -23,7 +23,7 @@ lint: fmt-check clippy ## Format check and lint
 clippy: ## Lint every target
 	cargo clippy --all-targets
 
-check: fmt-check clippy test ## The gate CI runs before publishing anything
+ci: check clippy test ## The gate CI runs before publishing anything
 
 release: ## Build the release binary
 	cargo build --release

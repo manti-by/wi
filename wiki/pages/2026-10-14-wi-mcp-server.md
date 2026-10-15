@@ -8,7 +8,7 @@ services: []
 branch: feature/mnt-238-openwiki-mcp-unified-binary
 tickets: [MNT-238]
 tags: [mcp, wiki, search, bm25, rust, release]
-related: [2026-10-14-wiki-search-ranking.md, 2026-10-14-installer-and-release-pipeline.md]
+related: [2026-10-14-wiki-search-ranking.md, 2026-10-14-installer-and-release-pipeline.md, 2026-10-14-differential-testing-parity.md, 2026-10-15-wiki-tooling-and-agents-file.md]
 ---
 # wi — the OpenWiki MCP server
 

@@ -18,15 +18,25 @@ names, error strings and output text are expected to match it byte-for-byte.
 
 ```console
 make help          # list every target
-make check         # fmt --check + clippy --all-targets + test — the gate CI runs
+make check         # cargo fmt --check ONLY — not a test gate, see below
+make ci            # check + clippy --all-targets + test — the real gate
 make smoke         # start the binary and drive a real MCP session against it
 make test          # unit tests only
+make clippy        # lint every target
+make run           # serve ./wiki/pages (ARGS=... to override)
 make release       # release binary
 ```
 
-Run `make check` before claiming anything works. It is what
-`.github/workflows/release.yml` gates publishing on, so a red tree must never be
-merged.
+Run `make ci` before claiming anything works. It is the full gate.
+
+**`make check` is not the gate, and CI runs only `make check`.** The target is
+`cargo fmt --check` on its own (`Makefile:18`); `make ci` is the one that adds
+clippy and tests (`Makefile:26`). Both `.github/workflows/ci.yml:27` and
+`.github/workflows/release.yml:33` invoke `make check`, so **nothing in CI
+currently runs `cargo test` or `clippy`** — the step is even labelled "cargo
+fmt, clippy and tests". Run `make ci` locally; do not assume a green CI run
+means the tests passed. `make lint` is also unreliable: it depends on
+`fmt-check`, which is not a target, so it silently runs clippy alone.
 
 ### Tests, and what they do not cover
 
@@ -58,7 +68,12 @@ deliberately do not do:
 - `wiki/` — this project's own documentation. `README.md` is the schema,
   `TEMPLATE.md` the page template, `INDEX.md` the catalog, `QUESTIONS.md` the
   open-questions queue.
+- `install.sh` — the `curl | sh` installer. Fails closed; see Security.
 - `scripts/smoke.sh` + `scripts/mcp_smoke.py` — the MCP smoke test.
+- `.github/workflows/` — `ci.yml` (every push and PR: `make check`, shell syntax,
+  shell lint, `install.sh --help`, the installer smoke test, and a second job
+  that builds with `--locked` and runs `make smoke`) and `release.yml`
+  (check → version gate → four-way build → publish).
 - `.github/scripts/` — release helpers: version gate, packaging, checksums,
   publish, shell lint, installer smoke test.
 
@@ -175,8 +190,10 @@ which is how a failed release is retried.
   invalidate the cache. Judged acceptable; a content hash would cost a full read
   per query, defeating the cache.
 - Frontmatter nested deeper than 127 levels (measured, not estimated), or
-  integers beyond 64 bits, are outside what the YAML parser accepts. Such a page
-  is skipped with a warning.
+  integers beyond 64 bits (`MetaValue::Int` is `i64`, `UInt` is `u64`), are
+  outside what the YAML parser accepts. Such a page is skipped with a warning.
+  The committed test only drives 2000 levels and asserts the skip is prompt
+  (`src/page.rs:815`), so 127 is not itself pinned by a test.
 - `PyYAML` implements YAML 1.1 and this binary's parser implements 1.2. A bare
   `yes`/`no`/`on`/`off` and leading-zero octal resolve differently. Documented in
   the README; quote those values.

@@ -61,8 +61,6 @@ what `install.sh` has staged in its temp directory, which is what makes a bare
 
 ## What the installer refuses to do
 
-Four things, each covered by a test in `.github/scripts/smoke-installer.sh`:
-
 - **A corrupt archive.** The checksum comparison fails and the install aborts.
 - **A missing checksum.** Skipping verification is not an option.
 - **A symlinked binary.** An archive could contain `wi -> /etc/passwd`, and a
@@ -72,9 +70,18 @@ Four things, each covered by a test in `.github/scripts/smoke-installer.sh`:
   directory and `mv`-ed into place, so an interrupted install cannot leave a
   truncated `wi` on `PATH`.
 
-Each failing case asserts the install directory is *completely empty*
+Each of the three *abort* paths — corrupt, no checksum, symlink — has a case in
+`.github/scripts/smoke-installer.sh`, which runs four cases in total: those three
+plus a `good` case asserting a correct archive installs and produces a working
+binary. Every abort case asserts the install directory is *completely empty*
 afterwards. "The installer exited non-zero" is not the same guarantee as "the
 installer wrote nothing", and only the second one is worth anything.
+
+The partial write is **not** covered by a test — it is a structural property of
+`install.sh` (stage to a temp name, then `mv`), and simulating a kill between
+the two would test the filesystem more than the installer. Corrected on
+2026-10-15: this page previously claimed all four refusals were test-covered,
+which the smoke script's own header contradicts.
 
 ## Why the smoke test serves fixtures over HTTP
 
