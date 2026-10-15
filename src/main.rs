@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
+use rmcp::ServiceExt;
+use rmcp::transport::io::stdio;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tracing_subscriber::EnvFilter;
@@ -40,6 +42,20 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 /// Pages directory used when `--wiki-path` is omitted.
 const DEFAULT_WIKI_PATH: &str = "wiki/pages";
 
+/// How a client reaches the server.
+///
+/// Stdio is the default because it is how MCP clients launch a local server:
+/// the client owns the process, and no port, socket or `Host` header is
+/// involved. HTTP is there for clients that connect to something already
+/// running, or that cannot spawn a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Transport {
+    /// Read JSON-RPC from stdin, write it to stdout. The default.
+    Stdio,
+    /// Serve Streamable HTTP on `--host` and `--port`.
+    Http,
+}
+
 /// Serve a Markdown wiki over the Model Context Protocol.
 #[derive(Debug, Parser)]
 #[command(
@@ -47,16 +63,23 @@ const DEFAULT_WIKI_PATH: &str = "wiki/pages";
     version,
     about = "Serve a Markdown wiki over MCP",
     long_about = "Serve a Markdown wiki over MCP.\n\n\
-                  Runs an MCP server that exposes the wiki_search, wiki_get_page and \
-                  wiki_list_pages tools over Streamable HTTP. Search ranks pages with BM25F \
-                  across each page's title, metadata and body."
+                  Exposes the wiki_search, wiki_get_page and wiki_list_pages tools. \
+                  Search ranks pages with BM25F across each page's title, metadata and \
+                  body.\n\n\
+                  By default the server speaks MCP over stdin/stdout, which is how \
+                  most clients launch a local server. Pass --transport http to serve \
+                  Streamable HTTP instead."
 )]
 struct Args {
-    /// Interface to bind.
+    /// How the server is reached.
+    #[arg(long, value_enum, default_value_t = Transport::Stdio)]
+    transport: Transport,
+
+    /// Interface to bind. HTTP transport only.
     #[arg(long, default_value = DEFAULT_HOST, value_name = "HOST")]
     host: String,
 
-    /// Port to bind.
+    /// Port to bind. HTTP transport only.
     #[arg(long, default_value_t = DEFAULT_PORT, value_name = "PORT")]
     port: u16,
 
@@ -68,7 +91,7 @@ struct Args {
     ///
     /// Only needed when `--host` binds somewhere other than loopback, so that
     /// clients reach the server by the address they were given rather than by
-    /// spoofing `Host: localhost`. Repeatable.
+    /// spoofing `Host: localhost`. Repeatable. HTTP transport only.
     #[arg(long = "allowed-host", value_name = "HOST")]
     allowed_hosts: Vec<String>,
 }
@@ -86,6 +109,33 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    match args.transport {
+        Transport::Stdio => serve_stdio(root).await,
+        Transport::Http => serve_http(args, root).await,
+    }
+}
+
+/// Serves MCP over stdin/stdout until the client closes the stream.
+async fn serve_stdio(root: PathBuf) -> anyhow::Result<()> {
+    // stdout is the JSON-RPC channel here, which is why every log line goes to
+    // stderr. One line from `println!` would corrupt the stream for the client.
+    // The resolved path is worth logging: the client picks the working
+    // directory, so the relative default can land somewhere else entirely.
+    tracing::info!(wiki_path = %root.display(), "wi serving over stdio");
+
+    let service = WikiService::with_cache(root, Arc::new(CorpusCache::new()));
+    let running = service
+        .serve(stdio())
+        .await
+        .map_err(|error| ServeError::Transport(Box::new(error)))?;
+
+    running.waiting().await?;
+    tracing::info!("wi stopped");
+    Ok(())
+}
+
+/// Validates the HTTP options, then serves Streamable HTTP until shut down.
+async fn serve_http(args: Args, root: PathBuf) -> anyhow::Result<()> {
     let address = wiki_host(&args.host)?;
     if !address.is_loopback() {
         // Nothing here authenticates a client, so an exposed bind is an
@@ -250,9 +300,10 @@ async fn shutdown_signal() {
 
 /// Initializes logging to stderr.
 ///
-/// stdout and stderr are both ordinary streams here rather than a JSON-RPC
-/// channel, but stderr is still the right home for logs: it keeps them out of
-/// the way of anything a user pipes the process into.
+/// stdout is the JSON-RPC channel in stdio mode, so stderr is the only safe
+/// home for logs: one line written to stdout corrupts the stream and the client
+/// drops the session. The explicit `std::io::stderr` is there for that reason
+/// alone — the subscriber's default writer is stdout.
 fn init_tracing() -> Result<(), ServeError> {
     tracing_subscriber::fmt()
         .with_env_filter(

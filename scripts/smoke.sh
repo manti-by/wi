@@ -3,9 +3,17 @@
 # End-to-end check that the built binary really speaks MCP.
 #
 # The unit tests cover parsing and ranking; nothing in `cargo test` can catch a
-# transport that starts but never answers, so this starts the binary, drives a
-# real Streamable-HTTP session through the three tools, and asserts on the text
-# each one returns.
+# transport that starts but never answers. There are two transports, so both are
+# driven through the same three tools and asserted on: a client must not be able
+# to tell which one it is connected to.
+#
+#   stdio — the default, and how most clients launch a local server
+#   http  — Streamable HTTP, for clients that connect to a running process
+#
+# Both halves run against the same fixture wiki, so the text the two transports
+# return is directly comparable and the ranking stays deterministic. Nothing
+# here reads the repository's own wiki on purpose: pages get archived, renamed
+# and re-synced, and a smoke test must not fail because a document changed.
 
 set -euo pipefail
 
@@ -52,7 +60,14 @@ tags: [ty]
 The relay consumer had type errors in CI.
 EOF
 
-"$binary" --wiki-path "$workdir/pages" --port "$port" >"$workdir/server.log" 2>&1 &
+echo "== stdio =="
+python3 "$repo_root/scripts/mcp_smoke_stdio.py" "$binary" "$workdir/pages"
+
+echo
+echo "== http =="
+
+"$binary" --wiki-path "$workdir/pages" --transport http --port "$port" \
+    >"$workdir/server.log" 2>&1 &
 server_pid=$!
 
 # Wait for the listener rather than sleeping a fixed amount, so a slow runner

@@ -34,6 +34,17 @@ pub enum ServeError {
     #[error("http server failed: {0}")]
     Serve(#[source] std::io::Error),
 
+    /// The stdio transport failed to start or ended in error.
+    ///
+    /// Boxed rather than stringified so the transport's own source chain
+    /// survives, the way every other variant here keeps its `#[source]`.
+    #[error("stdio transport failed: {0}")]
+    Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// The stdio transport's worker task ended unexpectedly.
+    #[error("stdio server task failed: {0}")]
+    StdioTask(#[from] tokio::task::JoinError),
+
     /// Logging initialization failed.
     #[error("failed to initialize logging: {0}")]
     Logging(#[source] Box<dyn std::error::Error + Send + Sync>),

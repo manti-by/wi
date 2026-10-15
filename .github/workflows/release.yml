@@ -30,7 +30,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo fmt, clippy and tests
-        run: make check
+        # `make ci` is check (fmt) + clippy + test. `make check` alone is fmt only.
+        run: make ci
 
   version:
     runs-on: ubuntu-latest

@@ -1,12 +1,16 @@
 BINARY := wi
 TARGET_DIR := target
 
-.PHONY: build run test check fmt fmt-check lint clippy release install smoke clean help
+.PHONY: build run test check fmt lint clippy release install smoke clean help
 
 build: ## Build the debug binary
 	cargo build
 
-run: ## Serve the wiki at ./wiki/pages (pass ARGS=... to override)
+# `make run` exists to hand a listener to a client, so it asks for HTTP rather
+# than the stdio default. Override with `make run ARGS="--transport stdio"`.
+ARGS ?= --transport http
+
+run: ## Serve the wiki at ./wiki/pages over HTTP (ARGS=... to override)
 	cargo run -- $(ARGS)
 
 test: ## Run the unit tests
@@ -18,7 +22,7 @@ fmt: ## Format the source
 check: ## Fail if the source is not formatted
 	cargo fmt --check
 
-lint: fmt-check clippy ## Format check and lint
+lint: check clippy ## Format check and lint
 
 clippy: ## Lint every target
 	cargo clippy --all-targets
@@ -31,7 +35,7 @@ release: ## Build the release binary
 install: ## Install the binary with cargo
 	cargo install --path .
 
-smoke: release ## Start the binary and drive a real MCP session against it
+smoke: release ## Drive a real MCP session over both transports
 	./scripts/smoke.sh
 
 clean: ## Remove build artifacts

@@ -1,6 +1,6 @@
 [project]
 name = "wi-tool"
-version = "0.1.0"
+version = "0.1.0"  # Update this when skill list is changed
 agent = "opencode"
 description = "MCP server for wiki pages"
 readme = "README.md"

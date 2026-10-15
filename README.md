@@ -6,8 +6,11 @@ the wiki, read a page and browse the catalog.
 
 ```console
 $ wi --wiki-path wiki/pages
-2026-09-23T10:14:02Z  INFO wi: wi listening bound=127.0.0.1:4321 wiki_path=/repo/wiki/pages
+2026-09-23T10:14:02Z  INFO wi: wi serving over stdio
 ```
+
+By default it speaks MCP over **stdin/stdout**, which is how MCP clients launch a
+local server. Pass `--transport http` to serve Streamable HTTP instead.
 
 ## Install
 
@@ -30,27 +33,53 @@ Uninstall is `rm ~/.local/bin/wi`. To build from source instead, use
 ## Usage
 
 ```console
-$ wi --help
+$ wi -h
 Serve a Markdown wiki over MCP
 
-USAGE:
-    wi [OPTIONS]
+Usage: wi [OPTIONS]
 
-OPTIONS:
-        --host <HOST>        Interface to bind [default: 127.0.0.1]
-        --port <PORT>        Port to bind [default: 4321]
-        --wiki-path <PATH>   Directory holding the `*.md` wiki pages [default: wiki/pages]
-        --allowed-host <HOST>  Extra hostname or host:port to accept in the Host header
-    -h, --help               Print help
-    -V, --version            Print version
+Options:
+      --transport <TRANSPORT>  How the server is reached [default: stdio] [possible values: stdio, http]
+      --host <HOST>            Interface to bind. HTTP transport only [default: 127.0.0.1]
+      --port <PORT>            Port to bind. HTTP transport only [default: 4321]
+      --wiki-path <PATH>       Directory holding the `*.md` wiki pages [default: wiki/pages]
+      --allowed-host <HOST>    Extra hostname or `host:port` to accept in the `Host` header
+  -h, --help                   Print help (see more with '--help')
+  -V, --version                Print version
 ```
 
-The server binds loopback by default, because it serves a project's private
-notes. Nothing here authenticates a client, so exposing it is a deliberate act
-and the server says so in a warning when it does:
+That is `wi -h` verbatim — regenerate it when the CLI changes, or drop it rather
+than let it drift. `--help` prints the same options plus the long description.
+
+`--transport` takes `stdio` (the default) or `http`. `--host`, `--port` and
+`--allowed-host` apply only to `http`; they are ignored on stdio, which has no
+socket.
+
+### stdio
+
+The client starts the process and talks to it over stdin/stdout. No port, no
+socket, no `Host` header, and no chance of one wi colliding with another.
+
+Because a client chooses the working directory, not you, **pass `--wiki-path` as
+an absolute path** in this mode. The default `wiki/pages` is relative, and will
+resolve against whatever directory the client happened to launch from.
+
+### http
+
+The server binds and serves until it is signalled, which suits a client that
+connects to something already running rather than launching it.
 
 ```console
-$ wi --host 0.0.0.0 --port 8080 --wiki-path ~/notes/wiki
+$ wi --transport http --port 4321 --wiki-path ~/notes/wiki
+2026-09-23T10:14:02Z  INFO wi: wi listening bound=127.0.0.1:4321 wiki_path=/home/me/notes/wiki
+```
+
+It binds loopback by default, because it serves a project's private notes.
+Nothing here authenticates a client, so exposing it is a deliberate act and the
+server says so in a warning when it does:
+
+```console
+$ wi --transport http --host 0.0.0.0 --port 8080 --wiki-path ~/notes/wiki
 WARN wi: serving on a non-loopback interface with no authentication; add
          --allowed-host for each name clients use to reach this address
 ```
@@ -62,7 +91,7 @@ When binding a wildcard there is no name clients would send, so add the names
 they actually use:
 
 ```console
-$ wi --host 0.0.0.0 --allowed-host wiki.internal --allowed-host 192.168.1.5
+$ wi --transport http --host 0.0.0.0 --allowed-host wiki.internal --allowed-host 192.168.1.5
 ```
 
 `--wiki-path` may be relative, in which case it resolves against the working
@@ -72,23 +101,23 @@ on every query.
 
 ## Connecting an MCP client
 
-The server speaks Streamable HTTP. In `opencode.json`:
+With the default stdio transport, the client launches the binary. In
+`opencode.json`:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "wi": {
-      "type": "remote",
-      "url": "http://127.0.0.1:4321/mcp",
+      "type": "local",
+      "command": ["wi", "--wiki-path", "/absolute/path/to/wiki/pages"],
       "enabled": true
     }
   }
 }
 ```
 
-In Claude Desktop's `claude_desktop_config.json`, run the binary as a local
-server instead:
+Claude Desktop's `claude_desktop_config.json` uses the same shape:
 
 ```json
 {
@@ -96,6 +125,21 @@ server instead:
     "wi": {
       "command": "wi",
       "args": ["--wiki-path", "/absolute/path/to/wiki/pages"]
+    }
+  }
+}
+```
+
+If you would rather keep a server running and point clients at it, start it with
+`--transport http` and register it as a remote endpoint instead:
+
+```json
+{
+  "mcp": {
+    "wi": {
+      "type": "remote",
+      "url": "http://127.0.0.1:4321/mcp",
+      "enabled": true
     }
   }
 }
@@ -218,15 +262,19 @@ Everything else about the page format matches.
 
 ```console
 $ make help          # list the targets
-$ make check         # fmt --check, clippy and tests — what CI runs
-$ make smoke         # start the binary and drive a real MCP session against it
+$ make ci            # fmt --check, clippy and tests — what CI runs
+$ make smoke         # drive a real MCP session over both transports
 $ make release       # build the release binary
 ```
 
 `make smoke` is worth knowing about: the unit tests cover parsing and ranking,
-but nothing in `cargo test` can tell you the transport starts and answers, so it
-boots the binary, drives an initialize/list/call sequence over HTTP and asserts
-on the text each tool returns.
+but nothing in `cargo test` can tell you a transport starts and answers. It boots
+the binary twice — once per transport — drives an initialize/list/call sequence
+through each, and asserts on the text the tools return. A client must not be able
+to tell which transport it is on.
+
+`make check` on its own is formatting only; the full gate is `make ci`, which is
+what both workflows invoke.
 
 ### Releasing
 

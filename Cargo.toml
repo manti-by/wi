@@ -1,6 +1,6 @@
 [package]
 name = "wi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "OpenWiki MCP server: search and read Markdown wiki pages over MCP"
 license = "BSD-3-Clause"
@@ -11,7 +11,7 @@ keywords = ["mcp", "wiki", "search", "bm25", "cli"]
 anyhow = "1.0.100"
 axum = "0.8.8"
 clap = { version = "4.5.54", features = ["derive"] }
-rmcp = { version = "3.5.1", features = ["server", "transport-streamable-http-server"] }
+rmcp = { version = "3.5.1", features = ["server", "transport-io", "transport-streamable-http-server"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml = "0.9.34"
