@@ -18,7 +18,7 @@ fmt: ## Format the source
 check: ## Fail if the source is not formatted
 	cargo fmt --check
 
-lint: fmt-check clippy ## Format check and lint
+lint: check clippy ## Format check and lint
 
 clippy: ## Lint every target
 	cargo clippy --all-targets

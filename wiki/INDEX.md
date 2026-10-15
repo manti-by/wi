@@ -9,7 +9,7 @@ with `/wiki-sync`; the plugin only scaffolds the wiki.
 
 _Newest first._
 
-- [Wiki tooling and AGENTS.md](pages/2026-10-15-wiki-tooling-and-agents-file.md) — Wiki + skill setup; two defects found while wiring it in (one still unfixed), and the `serde_yaml` deprecation (2026-10-15)
+- [Wiki tooling and AGENTS.md](pages/2026-10-15-wiki-tooling-and-agents-file.md) — Wiki + skill setup, stdio as the default transport, and the CI gate running neither tests nor clippy (2026-10-15)
 - [wi — the OpenWiki MCP server](pages/2026-10-14-wi-mcp-server.md) — What the binary is, how it runs, why it exists, and what interface parity means in practice (2026-10-14)
 - [Differential testing against the Python original](pages/2026-10-14-differential-testing-parity.md) — Why every porting bug was silent, and what caught them instead of unit tests (2026-10-14)
 - [Wiki search ranking](pages/2026-10-14-wiki-search-ranking.md) — BM25F zone weights, the analyzer, and the corpus cache (2026-10-14)
@@ -29,7 +29,8 @@ _Topic clusters maintained by the Consistency Agent; topics with the most pages 
 ### Delivery
 
 - [[2026-10-14-installer-and-release-pipeline]] - CI release and `curl | sh` install
-- [[2026-10-15-wiki-tooling-and-agents-file]] - skills, wiki scaffolding, AGENTS.md
+- [[2026-10-15-wiki-tooling-and-agents-file]] - skills, wiki scaffolding, AGENTS.md,
+  the stdio transport, and the `make check` / `make ci` split
 
 ### Open threads
 

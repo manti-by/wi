@@ -84,6 +84,70 @@ that is a defect depends on whether the product is now "WI Tool" or still
 OpenWiki's MCP server, which is why it is filed as Q-002 rather than fixed
 here.
 
+## Update — 2026-10-15 08:20
+
+### stdio becomes the default transport
+
+`wi` served Streamable HTTP only, because that is what MNT-238 specified. But
+HTTP is the wrong default for the client that matters: MCP clients launch a
+local server as a child process and speak to it over stdin/stdout. That needs no
+port, no socket, and no `Host` header, and it means two `wi` instances cannot
+collide.
+
+**File:** `src/main.rs`, `Cargo.toml`
+
+Added `--transport stdio|http`, defaulting to `stdio`. HTTP is unchanged behind
+the flag, including the `Host` allowlist coupling. `--host`, `--port` and
+`--allowed-host` are documented as HTTP-only rather than rejected, since silently
+ignoring a flag the user typed is its own kind of confusion.
+
+```console
+$ wi                                 # stdio
+$ wi --transport http --port 4321    # Streamable HTTP
+$ echo | wi                         # exits 1: never spoke MCP
+```
+
+Two details worth keeping:
+
+- **stdout is the JSON-RPC channel.** `init_tracing` writes to stderr for that
+  reason; one `println!` corrupts the stream and the client drops the session.
+  The stdio smoke test asserts it, failing on any non-JSON line on stdout.
+- **`--wiki-path` should be absolute in stdio mode.** The client chooses the
+  working directory, so the relative default `wiki/pages` can resolve somewhere
+  unexpected. Documented rather than changed, since a different default per
+  transport would be a worse surprise.
+
+`rmcp`'s stdio transport sits behind the `transport-io` feature, so the
+dependency gained it.
+
+### CI was not running the tests
+
+**File:** `Makefile`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`
+
+Commit `e6fd2d5` renamed `fmt-check` to `check`, so `make check` became
+formatting-only and a new `ci` target took over the old full-gate role. Both
+workflows still invoked `make check` — under a step named *"cargo fmt, clippy and
+tests"*. **Nothing in CI was running `cargo test` or `clippy`.** The 77 unit
+tests, and the parity guarantees in them, were not enforced on any push.
+
+`make lint` was broken too: it depended on `fmt-check`, which no longer existed.
+
+Both fixed — workflows call `make ci`, `lint` depends on `check`. The naming trap
+is recorded in AGENTS.md so it is not reintroduced: when a workflow step's name
+and the target it invokes disagree, one of them is lying.
+
+### `make smoke` now covers both transports
+
+**File:** `scripts/smoke.sh`, `scripts/mcp_smoke_stdio.py`
+
+One transport was tested while two existed, which is exactly how a transport can
+start and never answer without anything noticing. The stdio half spawns the real
+binary, drives a full session through the same three tools, and pins the exit
+status — closing stdin after a completed handshake must exit `0`, since a client
+closing its pipe on quit would otherwise see a spurious failure. The HTTP half
+keeps its fixture wiki so ranking stays deterministic; the stdio half runs against
+this repo's own pages, which also proves the server works in a real checkout.
+
 ## Follow-ups
 
 - **`serde_yaml` is deprecated and unmaintained** (0.9.34+deprecated; the author

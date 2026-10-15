@@ -18,34 +18,35 @@ names, error strings and output text are expected to match it byte-for-byte.
 
 ```console
 make help          # list every target
-make check         # cargo fmt --check ONLY — not a test gate, see below
-make ci            # check + clippy --all-targets + test — the real gate
-make smoke         # start the binary and drive a real MCP session against it
-make test          # unit tests only
+make ci            # check (fmt) + clippy --all-targets + test — the full gate
+make check         # cargo fmt --check only
 make clippy        # lint every target
+make test          # unit tests only
+make lint          # check + clippy
+make smoke         # drive a real MCP session over BOTH transports
 make run           # serve ./wiki/pages (ARGS=... to override)
 make release       # release binary
 ```
 
-Run `make ci` before claiming anything works. It is the full gate.
+Run `make ci` before claiming anything works. Both workflows call it.
 
-**`make check` is not the gate, and CI runs only `make check`.** The target is
-`cargo fmt --check` on its own (`Makefile:18`); `make ci` is the one that adds
-clippy and tests (`Makefile:26`). Both `.github/workflows/ci.yml:27` and
-`.github/workflows/release.yml:33` invoke `make check`, so **nothing in CI
-currently runs `cargo test` or `clippy`** — the step is even labelled "cargo
-fmt, clippy and tests". Run `make ci` locally; do not assume a green CI run
-means the tests passed. `make lint` is also unreliable: it depends on
-`fmt-check`, which is not a target, so it silently runs clippy alone.
+The naming is a trap worth stating once: **`make check` is formatting only.**
+It was briefly mis-wired — CI invoked `make check` while the step was labelled
+"cargo fmt, clippy and tests", so nothing in CI ran clippy or the 77 unit tests,
+and `make lint` depended on a `fmt-check` target that no longer existed. Both are
+fixed, but the lesson holds: when a workflow's step name and the target it
+invokes disagree, one of them is lying, and it is usually the CI.
 
 ### Tests, and what they do not cover
 
 Unit tests live beside the code as `#[cfg(test)]` modules. Two things they
 deliberately do not do:
 
-- **They do not test the transport.** `make smoke` does, by booting the binary
-  and driving initialize / `tools/list` / `tools/call` over HTTP. Both are
-  required before a change is considered done.
+- **They do not test either transport.** `make smoke` does, by booting the
+  binary and driving initialize / `tools/list` / `tools/call` — over stdio via
+  `scripts/mcp_smoke_stdio.py`, over HTTP via `scripts/mcp_smoke.py`. A change
+  to one transport must keep both passing; a client must not be able to tell
+  which one it is on.
 - **They do not test parity with the Python original.** A unit test written next
   to a reimplementation asserts the author's model of the original, not the
   original; when the model is wrong the test is wrong identically and passes.
@@ -54,7 +55,8 @@ deliberately do not do:
 
 ## Layout
 
-- `src/main.rs` — CLI (clap), bind, Streamable HTTP wiring, graceful shutdown.
+- `src/main.rs` — CLI (clap), transport selection, bind, graceful shutdown.
+  `--transport stdio` (default) or `--transport http`.
 - `src/tools.rs` — the MCP surface: the three tool definitions, argument
   validation, output formatting, `ServerHandler` impl.
 - `src/page.rs` — frontmatter parsing, metadata summary, snippets, and
@@ -126,6 +128,10 @@ produced no error and no failing test.
 
 ## Security
 
+- **stdout is the JSON-RPC channel in stdio mode.** Every log line goes to
+  stderr; a single `println!` corrupts the stream and the client drops the
+  session. `init_tracing` writes to stderr for exactly this reason — do not
+  "simplify" it to stdout.
 - **Never widen the bind without widening the `Host` allowlist.** The transport
   rejects unknown `Host` headers to stop DNS rebinding, and its default list is
   loopback-only. `--host 0.0.0.0` with the default list leaves the server
