@@ -12,7 +12,7 @@ related: [2026-10-14-wi-mcp-server.md, 2026-10-14-wiki-search-ranking.md, 2026-1
 ---
 # Differential testing against the Python original
 
-## Net effect
+## TL;DR
 
 `wi` is a port of the Python wiki tools in
 [odin#41](https://github.com/manti-by/odin/pull/41), and **every substantive bug
@@ -24,6 +24,14 @@ Three review rounds produced: a wrong tokenizer, a wrong frontmatter delimiter, 
 security hole in the `--host` flag, a page-dropping frontmatter bug in two
 different forms, and a flaky test suite that would have made the release gate red
 one run in four.
+
+## Net effect
+
+The practical takeaway is a rule, not a story: **whenever this port changes
+behaviour that the Python defines, the Python is the oracle and must be run.**
+Not read, not remembered, not modelled — run on the same inputs and diffed,
+including scores rather than only output shapes. The cost is an afternoon per
+round; the cost of not doing it was a wiki where pages silently vanished.
 
 ---
 
