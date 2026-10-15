@@ -24,7 +24,7 @@ make clippy        # lint every target
 make test          # unit tests only
 make lint          # check + clippy
 make smoke         # drive a real MCP session over BOTH transports
-make run           # serve ./wiki/pages (ARGS=... to override)
+make run           # serve ./wiki/pages over HTTP (ARGS=... to override)
 make release       # release binary
 ```
 

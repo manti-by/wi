@@ -33,22 +33,23 @@ Uninstall is `rm ~/.local/bin/wi`. To build from source instead, use
 ## Usage
 
 ```console
-$ wi --help
+$ wi -h
 Serve a Markdown wiki over MCP
 
-USAGE:
-    wi [OPTIONS]
+Usage: wi [OPTIONS]
 
-OPTIONS:
-        --transport <TRANSPORT>  How the server is reached [default: stdio]
-        --host <HOST>        Interface to bind. HTTP transport only [default: 127.0.0.1]
-        --port <PORT>        Port to bind. HTTP transport only [default: 4321]
-        --wiki-path <PATH>   Directory holding the `*.md` wiki pages [default: wiki/pages]
-        --allowed-host <HOST>  Extra hostname or host:port to accept in the Host header.
-                               HTTP transport only
-    -h, --help               Print help
-    -V, --version            Print version
+Options:
+      --transport <TRANSPORT>  How the server is reached [default: stdio] [possible values: stdio, http]
+      --host <HOST>            Interface to bind. HTTP transport only [default: 127.0.0.1]
+      --port <PORT>            Port to bind. HTTP transport only [default: 4321]
+      --wiki-path <PATH>       Directory holding the `*.md` wiki pages [default: wiki/pages]
+      --allowed-host <HOST>    Extra hostname or `host:port` to accept in the `Host` header
+  -h, --help                   Print help (see more with '--help')
+  -V, --version                Print version
 ```
+
+That is `wi -h` verbatim — regenerate it when the CLI changes, or drop it rather
+than let it drift. `--help` prints the same options plus the long description.
 
 `--transport` takes `stdio` (the default) or `http`. `--host`, `--port` and
 `--allowed-host` apply only to `http`; they are ignored on stdio, which has no
@@ -74,13 +75,11 @@ $ wi --transport http --port 4321 --wiki-path ~/notes/wiki
 ```
 
 It binds loopback by default, because it serves a project's private notes.
-
-The server binds loopback by default, because it serves a project's private
-notes. Nothing here authenticates a client, so exposing it is a deliberate act
-and the server says so in a warning when it does:
+Nothing here authenticates a client, so exposing it is a deliberate act and the
+server says so in a warning when it does:
 
 ```console
-$ wi --host 0.0.0.0 --port 8080 --wiki-path ~/notes/wiki
+$ wi --transport http --host 0.0.0.0 --port 8080 --wiki-path ~/notes/wiki
 WARN wi: serving on a non-loopback interface with no authentication; add
          --allowed-host for each name clients use to reach this address
 ```
@@ -92,7 +91,7 @@ When binding a wildcard there is no name clients would send, so add the names
 they actually use:
 
 ```console
-$ wi --host 0.0.0.0 --allowed-host wiki.internal --allowed-host 192.168.1.5
+$ wi --transport http --host 0.0.0.0 --allowed-host wiki.internal --allowed-host 192.168.1.5
 ```
 
 `--wiki-path` may be relative, in which case it resolves against the working

@@ -9,6 +9,7 @@ with `/wiki-sync`; the plugin only scaffolds the wiki.
 
 _Newest first._
 
+- [stdio transport PR review](pages/2026-10-15-stdio-pr-review.md) — Reviewing and fixing PR#1: `make run` inherited the new default, and the smoke test was coupled to a mutable wiki page (2026-10-15)
 - [Wiki tooling and AGENTS.md](pages/2026-10-15-wiki-tooling-and-agents-file.md) — Wiki + skill setup, stdio as the default transport, and the CI gate running neither tests nor clippy (2026-10-15)
 - [wi — the OpenWiki MCP server](pages/2026-10-14-wi-mcp-server.md) — What the binary is, how it runs, why it exists, and what interface parity means in practice (2026-10-14)
 - [Differential testing against the Python original](pages/2026-10-14-differential-testing-parity.md) — Why every porting bug was silent, and what caught them instead of unit tests (2026-10-14)

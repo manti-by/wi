@@ -43,7 +43,7 @@ jobs:
 
   mcp:
     # The unit tests cover the ranking and parsing; this job proves the binary
-    # still speaks MCP over HTTP, which no unit test can see.
+    # still speaks MCP over both transports, which no unit test can see.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

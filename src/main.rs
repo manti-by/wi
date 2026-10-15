@@ -117,15 +117,17 @@ async fn main() -> anyhow::Result<()> {
 
 /// Serves MCP over stdin/stdout until the client closes the stream.
 async fn serve_stdio(root: PathBuf) -> anyhow::Result<()> {
-    let service = WikiService::with_cache(root, Arc::new(CorpusCache::new()));
-    tracing::info!("wi serving over stdio");
-
     // stdout is the JSON-RPC channel here, which is why every log line goes to
     // stderr. One line from `println!` would corrupt the stream for the client.
+    // The resolved path is worth logging: the client picks the working
+    // directory, so the relative default can land somewhere else entirely.
+    tracing::info!(wiki_path = %root.display(), "wi serving over stdio");
+
+    let service = WikiService::with_cache(root, Arc::new(CorpusCache::new()));
     let running = service
         .serve(stdio())
         .await
-        .map_err(|error| ServeError::Transport(error.to_string()))?;
+        .map_err(|error| ServeError::Transport(Box::new(error)))?;
 
     running.waiting().await?;
     tracing::info!("wi stopped");
@@ -298,9 +300,10 @@ async fn shutdown_signal() {
 
 /// Initializes logging to stderr.
 ///
-/// stdout and stderr are both ordinary streams here rather than a JSON-RPC
-/// channel, but stderr is still the right home for logs: it keeps them out of
-/// the way of anything a user pipes the process into.
+/// stdout is the JSON-RPC channel in stdio mode, so stderr is the only safe
+/// home for logs: one line written to stdout corrupts the stream and the client
+/// drops the session. The explicit `std::io::stderr` is there for that reason
+/// alone — the subscriber's default writer is stdout.
 fn init_tracing() -> Result<(), ServeError> {
     tracing_subscriber::fmt()
         .with_env_filter(

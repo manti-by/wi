@@ -4,26 +4,34 @@
 Complements mcp_smoke.py, which covers HTTP. Two transports means two
 contracts: the tool surface must be identical across both, and stdout must
 carry nothing but JSON-RPC.
+
+smoke.sh hands both scripts the same fixture wiki, so the assertions here
+mirror mcp_smoke.py's and the two transports can be compared line for line.
+
+Usage: mcp_smoke_stdio.py <binary> <wiki-dir>
 """
 
 import json
 import subprocess
 import sys
+import tempfile
 
-BINARY = sys.argv[1] if len(sys.argv) > 1 else "target/release/wi"
-WIKI = sys.argv[2] if len(sys.argv) > 2 else "wiki/pages"
 PROTOCOL_VERSION = "2025-06-18"
+
+# A page from smoke.sh's fixture. Naming it is safe here precisely because the
+# fixture is generated; naming one from the repository's own wiki is not.
+PAGE = "2026-09-23-relay-mode"
 
 
 class StdioSession:
     """One MCP session over a child process's stdin/stdout."""
 
-    def __init__(self):
+    def __init__(self, binary, wiki, log):
         self.process = subprocess.Popen(
-            [BINARY, "--transport", "stdio", "--wiki-path", WIKI],
+            [binary, "--transport", "stdio", "--wiki-path", wiki],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=log,
             text=True,
             bufsize=1,
         )
@@ -86,46 +94,72 @@ def expect(condition, message):
         raise SystemExit(f"smoke-stdio: {message}")
 
 
-session = StdioSession()
-reply = session.call(
-    "initialize",
-    {
-        "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": {},
-        "clientInfo": {"name": "smoke", "version": "1"},
-    },
-)
-expect(reply["result"]["serverInfo"]["name"] == "wi", "server did not identify as wi")
-print("ok   initialize")
+def drive(binary, wiki, log):
+    session = StdioSession(binary, wiki, log)
 
-session.notify("notifications/initialized")
+    reply = session.call(
+        "initialize",
+        {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "smoke", "version": "1"},
+        },
+    )
+    expect(reply["result"]["serverInfo"]["name"] == "wi", "server did not identify as wi")
+    print("ok   initialize")
 
-tools = session.call("tools/list")
-names = [tool["name"] for tool in tools["result"]["tools"]]
-expect(
-    names == ["wiki_search", "wiki_get_page", "wiki_list_pages"],
-    f"unexpected tool list: {names}",
-)
-print("ok   tools/list")
+    session.notify("notifications/initialized")
 
-failed, text = session.tool("wiki_list_pages", {})
-expect(not failed, f"wiki_list_pages failed: {text}")
-expect("2026-10-14-wi-mcp-server.md" in text, f"list is missing the repo's own page: {text}")
-print("ok   wiki_list_pages")
+    tools = session.call("tools/list")
+    names = [tool["name"] for tool in tools["result"]["tools"]]
+    expect(
+        names == ["wiki_search", "wiki_get_page", "wiki_list_pages"],
+        f"unexpected tool list: {names}",
+    )
+    for tool in tools["result"]["tools"]:
+        expect(tool["inputSchema"]["type"] == "object", f"{tool['name']} schema is not an object")
+    print("ok   tools/list")
 
-failed, text = session.tool("wiki_search", {"query": "relay mode computed on read"})
-expect(not failed, f"wiki_search failed: {text}")
-expect(text.startswith("1. "), f"search returned no ranked hits: {text}")
-expect("   > L" in text, f"search hit has no snippets: {text}")
-print("ok   wiki_search ranks and snippets")
+    failed, text = session.tool("wiki_list_pages", {})
+    expect(not failed, f"wiki_list_pages failed: {text}")
+    expect(f"{PAGE}.md" in text, f"list is missing the relay page: {text}")
+    print("ok   wiki_list_pages")
 
-failed, text = session.tool("wiki_get_page", {"name": "2026-10-14-wi-mcp-server"})
-expect(not failed, f"wiki_get_page failed: {text}")
-expect(text.startswith("---\n"), "page body lost its frontmatter")
-print("ok   wiki_get_page")
+    failed, text = session.tool("wiki_search", {"query": "relay mode"})
+    expect(not failed, f"wiki_search failed: {text}")
+    expect(text.startswith(f"1. {PAGE}.md (score "), f"ranking is wrong: {text}")
+    expect("   > L1: " in text, f"search hit has no snippets: {text}")
+    print("ok   wiki_search ranks the relevant page first")
 
-# The tool surface must be identical to the HTTP transport's, so an agent
-# cannot tell which one it was connected to.
-session.close()
-print("ok   exits cleanly when stdin closes")
-print("smoke-stdio: all checks passed")
+    failed, text = session.tool("wiki_get_page", {"name": PAGE})
+    expect(not failed, f"wiki_get_page failed: {text}")
+    expect(text.startswith("---\ntitle: Relay mode computed on read"), f"frontmatter is missing: {text}")
+    print("ok   wiki_get_page returns the whole file")
+
+    # The tool surface must be identical to the HTTP transport's, so an agent
+    # cannot tell which one it was connected to.
+    session.close()
+    print("ok   exits cleanly when stdin closes")
+
+
+def main():
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: mcp_smoke_stdio.py <binary> <wiki-dir>")
+    binary, wiki = sys.argv[1], sys.argv[2]
+
+    # stderr goes to a file, not a pipe nobody reads: a pipe that fills up
+    # blocks the server mid-session, and when the transport starts and never
+    # answers, its log is the first thing worth seeing.
+    with tempfile.TemporaryFile("w+") as log:
+        try:
+            drive(binary, wiki, log)
+        except SystemExit as failure:
+            log.seek(0)
+            sys.stderr.write(f"--- {binary} stderr ---\n{log.read()}\n")
+            raise failure
+
+    print("smoke-stdio: all checks passed")
+
+
+if __name__ == "__main__":
+    main()

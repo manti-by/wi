@@ -10,9 +10,10 @@
 #   stdio — the default, and how most clients launch a local server
 #   http  — Streamable HTTP, for clients that connect to a running process
 #
-# The HTTP half uses a fixture wiki so the ranking is deterministic; the stdio
-# half runs against this repo's own wiki, which also proves the server works out
-# of the box in a real checkout.
+# Both halves run against the same fixture wiki, so the text the two transports
+# return is directly comparable and the ranking stays deterministic. Nothing
+# here reads the repository's own wiki on purpose: pages get archived, renamed
+# and re-synced, and a smoke test must not fail because a document changed.
 
 set -euo pipefail
 
@@ -27,12 +28,6 @@ fi
 
 workdir=$(mktemp -d)
 trap 'kill "${server_pid:-0}" 2>/dev/null || true; rm -rf "$workdir"' EXIT
-
-echo "== stdio =="
-python3 "$repo_root/scripts/mcp_smoke_stdio.py" "$binary" "$repo_root/wiki/pages"
-
-echo
-echo "== http =="
 
 # A fixture wiki with enough signal for the ranking to be distinguishable: one
 # page about relay modes, one about something unrelated.
@@ -64,6 +59,12 @@ tags: [ty]
 
 The relay consumer had type errors in CI.
 EOF
+
+echo "== stdio =="
+python3 "$repo_root/scripts/mcp_smoke_stdio.py" "$binary" "$workdir/pages"
+
+echo
+echo "== http =="
 
 "$binary" --wiki-path "$workdir/pages" --transport http --port "$port" \
     >"$workdir/server.log" 2>&1 &
