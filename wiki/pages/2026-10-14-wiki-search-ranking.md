@@ -3,9 +3,12 @@ title: 'Wiki search ranking'
 date: '2026-10-14'
 type: investigation
 status: resolved
+session_id: '-'
+services: []
+branch: feature/mnt-238-openwiki-mcp-unified-binary
 tickets: [MNT-238]
 tags: [search, bm25, ranking, relevance]
-related: [2026-10-14-wi-mcp-server]
+related: [2026-10-14-wi-mcp-server.md, 2026-10-14-differential-testing-parity.md]
 ---
 # Wiki search ranking
 
@@ -82,7 +85,8 @@ divisor for every query.
 
 That is the general hazard in porting a ranker: the analyzer is not a detail of
 tokenization, it is an input to the corpus statistics. A divergence that looks
-cosmetic in one function propagates into every score.
+cosmetic in one function propagates into every score. How this one was caught,
+and what it took to be sure, is in [[2026-10-14-differential-testing-parity]].
 
 ## Why results are deterministic
 
@@ -137,3 +141,16 @@ in-place rewrite of equal length within the filesystem's mtime granularity —
 would not invalidate the cache. In practice this does not occur on the filesystems
 involved; a content hash would cost a full read per query, which is exactly what
 the cache exists to avoid.
+
+---
+
+## Follow-ups
+
+- The mtime-and-size fingerprint has a theoretical blind spot, documented above
+  and judged acceptable. Nothing scheduled.
+
+## References
+
+- Related: [[2026-10-14-wi-mcp-server]], [[2026-10-14-differential-testing-parity]]
+- Code: `src/search.rs` (analyzer and BM25F), `src/corpus.rs` (cache and `rank`),
+  `src/config.rs` (zone weights and tunables)

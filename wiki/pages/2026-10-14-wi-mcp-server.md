@@ -1,20 +1,25 @@
 ---
-title: 'wi — OpenWiki MCP server'
+title: 'wi — the OpenWiki MCP server'
 date: '2026-10-14'
 type: implementation
 status: resolved
+session_id: '-'
+services: []
+branch: feature/mnt-238-openwiki-mcp-unified-binary
 tickets: [MNT-238]
 tags: [mcp, wiki, search, bm25, rust, release]
-related: [2026-10-14-wiki-search-ranking, 2026-10-14-installer-and-release-pipeline]
+related: [2026-10-14-wiki-search-ranking.md, 2026-10-14-installer-and-release-pipeline.md]
 ---
-# wi — OpenWiki MCP server
+# wi — the OpenWiki MCP server
 
 ## TL;DR
 
 `wi` is a single Rust binary that serves a directory of Markdown wiki pages over
 MCP. It exposes three tools — `wiki_search`, `wiki_get_page` and
 `wiki_list_pages` — and replaces a Python MCP server that did the same thing
-inside another project.
+inside another project. Three review rounds against that Python source found
+every one of the porting bugs to be *silent*: nothing raised, and a page that
+existed on disk simply stopped being findable.
 
 ## Running it
 
@@ -83,9 +88,18 @@ The general lesson is the one worth carrying: every one of these bugs was
 *silent*. Nothing raised, nothing logged an error, and a page that existed on
 disk simply stopped being findable. The only reason they were caught is that a
 differential harness ran the Rust against the Python on the same inputs — a unit
-test written alongside the bug passes just as happily.
+test written alongside the bug passes just as happily. See
+[[2026-10-14-differential-testing-parity]] for how that harness is driven.
 
-See [wiki search ranking](2026-10-14-wiki-search-ranking.md) for why the ranking
-behaves the way it does, and
-[installer and release pipeline](2026-10-14-installer-and-release-pipeline.md)
-for how a version bump becomes a release.
+---
+
+## Follow-ups
+
+- None for the port itself. The open dependency question is recorded in
+  [[2026-10-15-wiki-tooling-and-agents-file]].
+
+## References
+
+- Related: [[2026-10-14-wiki-search-ranking]], [[2026-10-14-installer-and-release-pipeline]]
+- External: https://github.com/manti-by/odin/pull/41 (the wiki tools this port replaces)
+- External: https://github.com/manti-by/sk (the install/release model this follows)

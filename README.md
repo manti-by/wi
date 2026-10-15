@@ -1,4 +1,4 @@
-# wi
+# WI Tool
 
 An MCP server for a Markdown wiki. One binary, no configuration file: point it
 at a directory of `*.md` pages and it serves three tools that let an agent search
@@ -208,8 +208,8 @@ have to be quoted anyway if you want them stable:
   string `01` here.
 
 Quote the value (`status: "yes"`, `rev: "01"`) and both implementations agree.
-Integers beyond 64 bits and frontmatter nested more than about 128 levels deep
-are also outside what the YAML parser here accepts; such a page is skipped with a
+Integers beyond 64 bits and frontmatter nested deeper than 127 levels are also
+outside what the YAML parser here accepts; such a page is skipped with a
 warning, the same as any other unparseable frontmatter.
 
 Everything else about the page format matches.

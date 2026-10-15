@@ -1,33 +1,53 @@
-# wi — documentation wiki
+# WI Tool Wiki
 
-These pages document `wi` itself. `wi` reads `pages/` from this directory by
-default, so the project's own wiki is the best fixture to try it against:
+A persistent, compounding knowledge base for this project. Each page captures **one session** -
+a debugging chase, a code review, an investigation into how something works, or a set of changes
+- so the reasoning survives after the terminal scrollback is gone.
 
-```console
-$ cargo run
-2026-10-14T10:14:02Z  INFO wi: wi listening bound=127.0.0.1:4321 wiki_path=/repo/wiki/pages
+Inspired by [Karpathy's LLM-maintained wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f):
+the human curates and directs; the agent does the bookkeeping (writing pages, cross-linking,
+keeping the index current). Pages are plain Markdown so they stay human-readable and diff cleanly in git.
+
+## Layout
+
+- `README.md` - This file - conventions (the "schema").
+- `TEMPLATE.md` - The one unified page template. Copy it to start a page.
+- `INDEX.md` - Catalog of every page with a one-line summary. Kept current on each new page.
+- `QUESTIONS.md` - Open questions from the Consistency Agent about wiki discrepancies, awaiting a human answer.
+- `pages/YYYY-MM-DD-<topic>.md` - The pages themselves, created on demand by `/wiki-update`.
+- `.openwiki-sessions.json` - Internal cache mapping session id to page file (`{ "<session_id>": "<file>.md" }`),
+  kept current by `/wiki-update`; created on first use. Optional.
+
+## Naming convention
+
+```
+pages/YYYY-MM-DD-kebab-case-topic.md
 ```
 
-Then point an MCP client at `http://127.0.0.1:4321/mcp` and ask it what this
-project is and why the search ranking is weighted the way it is.
+- Date-prefixed so pages sort chronologically and filenames stay unique.
+- `topic` is a short kebab-case slug of the subject (e.g. `multi-agent-plan-step`, `composite-command`).
+- Meta files (`README.md`, `TEMPLATE.md`, `INDEX.md`, `QUESTIONS.md`) are **not** date-prefixed.
 
-## Pages
+## Page types
 
-| Page | About |
-| --- | --- |
-| [wi — OpenWiki MCP server](pages/2026-10-14-wi-mcp-server.md) | What the binary is, how it runs, and why it exists |
-| [Wiki search ranking](pages/2026-10-14-wiki-search-ranking.md) | BM25F zone weights, the analyzer, and the corpus cache |
-| [Installer and release pipeline](pages/2026-10-14-installer-and-release-pipeline.md) | How a version bump becomes a release, and what the installer refuses to do |
+Every page declares a `type` in its frontmatter. The template lists the recommended sections for each:
 
-## Conventions
+- `debug` - Chasing a symptom to a root cause. Symptom -> steps -> root cause -> fix.
+- `investigation` - Understanding how a subsystem works / where a gap is. No single fix.
+- `code-review` - Findings against a diff or branch. Numbered findings + summary table.
+- `implementation` - A set of changes that were made. Steps with before/after + test results.
 
-Pages are `YYYY-MM-DD-<kebab-topic>.md`, which makes the alphabetical listing
-chronological and gives search a deterministic tie-break.
+## Frontmatter
 
-Frontmatter is optional but expected. `title`, `date`, `type` and `status` drive
-the one-line summaries that `wiki_list_pages` prints; `tags` and `related` drive
-search and cross-linking. `type` is one of `debug`, `investigation`,
-`code-review` or `implementation`.
+Every page starts with YAML frontmatter (see `TEMPLATE.md`). This is what makes the wiki
+machine-queryable — you can grep for a ticket, a service, or a tag across all pages.
 
-Write down *why* a decision was made and what was ruled out. A page that only
-restates what the code does is already in the code, and goes stale.
+- `title`, `date`, `type`, `status`, `session_id` - always set.
+- `services`, `branch`, `tickets`, `tags` - set what applies; leave empty (`[]` / `-`) otherwise.
+- `related` - filenames of pages this one links to. Keep it in sync with the `[[...]]` links in the body.
+
+## Cross-linking
+
+Link related pages inline with `[[filename-without-.md]]` (e.g. `[[2026-07-09-otel-ssl-cert-debug]]`)
+and mirror them in the `related:` frontmatter list. Cross-links are what turn a folder of notes
+into a knowledge graph - always link back to prior pages on the same subsystem.

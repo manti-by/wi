@@ -3,9 +3,12 @@ title: 'Installer and release pipeline'
 date: '2026-10-14'
 type: implementation
 status: resolved
+session_id: '-'
+services: []
+branch: feature/mnt-238-openwiki-mcp-unified-binary
 tickets: [MNT-238]
 tags: [ci, release, installer, security]
-related: [2026-10-14-wi-mcp-server]
+related: [2026-10-14-wi-mcp-server.md, 2026-10-15-wiki-tooling-and-agents-file.md]
 ---
 # Installer and release pipeline
 
@@ -89,3 +92,18 @@ No Homebrew tap, no Nix, no apt/deb packages, no `cargo publish`. The install
 script covers `curl | sh` the way `uv` does, which is the whole documented path.
 Adding a second distribution channel means maintaining it; if nobody has asked,
 it is not worth the release matrix it would double.
+
+---
+
+## Follow-ups
+
+- `sk.toml` was added after this page was first written, so the version gate now
+  cross-checks it against `Cargo.toml`. See [[2026-10-15-wiki-tooling-and-agents-file]].
+- No second distribution channel until someone asks for one.
+
+## References
+
+- Related: [[2026-10-14-wi-mcp-server]], [[2026-10-15-wiki-tooling-and-agents-file]]
+- Code: `.github/workflows/release.yml`, `.github/scripts/detect-version.sh`,
+  `install.sh`, `.github/scripts/smoke-installer.sh`
+- External: https://github.com/manti-by/sk (the pipeline this mirrors)
