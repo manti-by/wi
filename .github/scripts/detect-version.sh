@@ -3,9 +3,10 @@
 # Decides whether a push to master warrants a release, and reports the version
 # it would publish.
 #
-# Cargo.toml is the source of truth for the version. sk.toml mirrors it, and
-# the two are asserted to agree: otherwise a release can go out whose `sk.toml`
-# disagrees with its own tag. The comparison is against the `version` line at
+# Cargo.toml is the source of truth for the version. sk.toml is deliberately
+# NOT consulted: its version tracks the pinned skill set, not the binary, so the
+# two are expected to differ and comparing them would fail releases for a reason
+# unrelated to the code. The comparison is against the `version` line at
 # $BEFORE, the commit the pushed ref pointed at beforehand. An all-zero BEFORE
 # means a brand-new branch with no predecessor, which counts as a change.
 #
@@ -29,15 +30,6 @@ cargo_version=$(read_version Cargo.toml)
 if [ -z "$cargo_version" ]; then
     echo "could not read version out of Cargo.toml" >&2
     exit 1
-fi
-
-if [ -f sk.toml ]; then
-    manifest_version=$(read_version sk.toml)
-    if [ "$manifest_version" != "$cargo_version" ]; then
-        echo "sk.toml version '$manifest_version' does not match Cargo.toml version '$cargo_version'" >&2
-        echo "bump project.version in sk.toml alongside version in Cargo.toml" >&2
-        exit 1
-    fi
 fi
 
 previous=''

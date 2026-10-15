@@ -285,6 +285,12 @@ gated behind `make check`, so a red tree never releases. A manual
 `workflow_dispatch` re-runs the publish without a version change, which is how a
 failed release is retried.
 
+The `version` in `Cargo.toml` and the `project.version` in `sk.toml` describe
+different things and are not expected to match. The first tracks the binary and
+is bumped when the code changes; the second tracks the pinned skill set and is
+bumped when the `skills = [...]` list changes. The release gate reads only
+`Cargo.toml`.
+
 ## License
 
 BSD-3-Clause.

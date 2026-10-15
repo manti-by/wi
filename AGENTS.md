@@ -72,10 +72,10 @@ deliberately do not do:
   open-questions queue.
 - `install.sh` — the `curl | sh` installer. Fails closed; see Security.
 - `scripts/smoke.sh` + `scripts/mcp_smoke.py` — the MCP smoke test.
-- `.github/workflows/` — `ci.yml` (every push and PR: `make check`, shell syntax,
+- `.github/workflows/` — `ci.yml` (every push and PR: `make ci`, shell syntax,
   shell lint, `install.sh --help`, the installer smoke test, and a second job
   that builds with `--locked` and runs `make smoke`) and `release.yml`
-  (check → version gate → four-way build → publish).
+  (`make ci` → version gate → four-way build → publish).
 - `.github/scripts/` — release helpers: version gate, packaging, checksums,
   publish, shell lint, installer smoke test.
 
@@ -175,13 +175,20 @@ A version bump in `Cargo.toml` merged to `master` triggers the release. There is
 no manual `gh release create`.
 
 1. Bump `version` in `Cargo.toml`.
-2. Bump `project.version` in `sk.toml` to match. `.github/scripts/detect-version.sh`
-   fails the release if they disagree — this is inherited from `sk` so a release
-   can never go out whose metadata contradicts its own tag.
-3. Merge. CI builds the four platform binaries, writes checksums, publishes `v<version>`.
+2. Merge. CI builds the four platform binaries, writes checksums, publishes `v<version>`.
 
 `workflow_dispatch` on the release workflow republishes without a version bump,
 which is how a failed release is retried.
+
+**The two version fields are unrelated, and must stay that way.**
+`Cargo.toml`'s `version` describes the *binary* — bump it when the code changes.
+`sk.toml`'s `project.version` describes the *pinned skill set* — bump it when the
+`skills = [...]` list in `sk.toml` changes. `sk.toml` even says so inline
+("Update this when skill list is changed"). Code releases and skill sync
+happen on independent cadences, so `0.2.0` in one and `0.1.0` in the other is a
+correct state, not drift to be reconciled. Nothing should assert they are equal:
+`detect-version.sh` used to, and it failed releases for having shipped code
+without a skill change. Do not reintroduce that comparison.
 
 ## Known issues
 

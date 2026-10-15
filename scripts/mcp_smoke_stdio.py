@@ -12,11 +12,21 @@ Usage: mcp_smoke_stdio.py <binary> <wiki-dir>
 """
 
 import json
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 PROTOCOL_VERSION = "2025-06-18"
+
+# A server that accepts a request and never answers must fail this script, not
+# hang it. Nothing upstream bounds the wait — neither the job nor smoke.sh — so
+# an unbounded readline sits forever on a runner with no failure to show for it.
+# Long enough that a loaded machine does not trip it, short enough that a real
+# hang is reported in seconds rather than at the CI timeout.
+CALL_TIMEOUT = 15
 
 # A page from smoke.sh's fixture. Naming it is safe here precisely because the
 # fixture is generated; naming one from the repository's own wiki is not.
@@ -37,6 +47,24 @@ class StdioSession:
         )
         self.next_id = 0
 
+        # stdout is drained by one reader thread for the whole session, and the
+        # lines it reads go on a queue in order. The main thread must be able to
+        # stop waiting *while somebody is still reading the pipe*, which rules
+        # out reading inline: a `select` on an already-buffered file object does
+        # not see bytes that `readline` pulled ahead, so it either misses a
+        # response or fires early. A thread has no such blind spot — it blocks
+        # in the read, not in the wait. Daemon so it cannot outlive the script
+        # if a failure kills the process first.
+        self.lines = queue.Queue()
+        self.reader = threading.Thread(target=self._drain_stdout, daemon=True)
+        self.reader.start()
+
+    def _drain_stdout(self):
+        """Move every stdout line onto the queue, then mark EOF with None."""
+        for line in iter(self.process.stdout.readline, ""):
+            self.lines.put(line)
+        self.lines.put(None)
+
     def send(self, message):
         self.process.stdin.write(json.dumps(message) + "\n")
         self.process.stdin.flush()
@@ -47,9 +75,19 @@ class StdioSession:
         if params is not None:
             request["params"] = params
         self.send(request)
+        # One deadline for the whole wait, not per line: a response is one line,
+        # so a per-line budget would only ever matter if the server dribbled
+        # garbage, which the non-JSON branch below rejects anyway.
+        deadline = time.monotonic() + CALL_TIMEOUT
         while True:
-            line = self.process.stdout.readline()
-            if not line:
+            remaining = deadline - time.monotonic()
+            try:
+                # A non-positive `remaining` raises Empty immediately, so an
+                # already-expired deadline fails here rather than blocking.
+                line = self.lines.get(timeout=remaining)
+            except queue.Empty:
+                self._kill(f"no response to {method} within {CALL_TIMEOUT}s")
+            if line is None:
                 raise SystemExit(f"smoke-stdio: stream closed during {method}")
             try:
                 return json.loads(line)
@@ -58,6 +96,17 @@ class StdioSession:
                     f"smoke-stdio: stdout carried non-JSON during {method}: {line!r}\n"
                     "  stdout is the JSON-RPC channel; logs must go to stderr"
                 )
+
+    def _kill(self, reason):
+        """Kill the child and fail. Used when the session is already unusable."""
+        self.process.kill()
+        # Reap it: a killed child that nobody waits on lingers as a zombie, and
+        # this script is short enough that it is about to exit anyway.
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise SystemExit(f"smoke-stdio: {reason}")
 
     def notify(self, method, params=None):
         message = {"jsonrpc": "2.0", "method": method}
